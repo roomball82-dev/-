@@ -1,4 +1,5 @@
 import json
+import re
 import requests
 import streamlit as st
 from openai import OpenAI
@@ -13,6 +14,10 @@ st.caption("식당 잘 아는 친구처럼, 대화로 조건을 정리하고 3�
 st.sidebar.header("🔑 API 설정")
 openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
 kakao_key = st.sidebar.text_input("Kakao Local REST API Key", type="password")
+
+# 디버그 옵션
+st.sidebar.markdown("---")
+debug_mode = st.sidebar.checkbox("🛠️ 디버그 모드(LLM 원문 출력)", value=True)
 
 client = OpenAI(api_key=openai_key) if openai_key else None
 
@@ -29,6 +34,32 @@ if "messages" not in st.session_state:
 
 if "last_conditions" not in st.session_state:
     st.session_state.last_conditions = {}
+
+if "last_rerank_raw" not in st.session_state:
+    st.session_state.last_rerank_raw = ""
+
+if "last_extract_raw" not in st.session_state:
+    st.session_state.last_extract_raw = ""
+
+# -----------------------------
+# Helpers: robust JSON parsing
+# -----------------------------
+def safe_json_load(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+def extract_first_json_object(text: str):
+    """
+    LLM이 JSON 앞뒤로 말을 붙여도, 가장 그럴듯한 JSON object를 뽑아내는 안전장치.
+    - response_format이 먹히면 필요 없지만, 예외 상황 대비.
+    """
+    # 가장 큰 { ... } 덩어리 찾기
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    return safe_json_load(m.group(0))
 
 # -----------------------------
 # Kakao API
@@ -80,13 +111,16 @@ ready_to_recommend 기준:
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(messages, ensure_ascii=False)}
         ],
-        temperature=0.2
+        temperature=0.2,
+        # 가능하면 JSON 강제 (object 형태라 잘 맞음)
+        response_format={"type": "json_object"},
     )
 
-    try:
-        return json.loads(res.choices[0].message.content.strip())
-    except:
-        return {}
+    raw = (res.choices[0].message.content or "").strip()
+    st.session_state.last_extract_raw = raw
+
+    parsed = safe_json_load(raw) or extract_first_json_object(raw)
+    return parsed or {}
 
 # -----------------------------
 # 2) 부족한 정보 질문 (친구톤)
@@ -117,7 +151,7 @@ def generate_followup_question(conditions):
         messages=[{"role": "user", "content": prompt}],
         temperature=0.85
     )
-    return res.choices[0].message.content.strip()
+    return (res.choices[0].message.content or "").strip()
 
 # -----------------------------
 # 3) Kakao 검색어 만들기
@@ -138,6 +172,11 @@ def build_query(conditions):
 
 # -----------------------------
 # 4) 후보 -> BEST3 재랭킹 + 키워드/근거 생성
+#   핵심 안정화 포인트:
+#   - output을 { "picks": [...] } object로 바꿈 (json_object 강제 가능)
+#   - response_format={"type":"json_object"} 사용
+#   - 파싱 실패 시 1회 자동 재시도
+#   - 마지막 방어로 {..} 덩어리 추출
 # -----------------------------
 def rerank_and_format(conditions, places):
     if client is None:
@@ -158,16 +197,18 @@ def rerank_and_format(conditions, places):
 너는 '결정 메이트'다.
 사용자 조건에 맞춰 아래 후보 중 BEST 3곳만 골라라.
 
-반드시 아래 JSON 형식으로만 출력해라:
-[
-  {{
-    "id": "...",
-    "one_line": "짧은 한줄 소개 (친구톤)",
-    "hashtags": ["#...","#..."],
-    "matched_conditions": ["사용자 조건 중 실제로 반영한 것"],
-    "reason": "왜 추천인지 2~3문장"
-  }}
-]
+반드시 아래 JSON 형식(오브젝트)으로만 출력해라:
+{{
+  "picks": [
+    {{
+      "id": "...",
+      "one_line": "짧은 한줄 소개 (친구톤)",
+      "hashtags": ["#...","#..."],
+      "matched_conditions": ["사용자 조건 중 실제로 반영한 것"],
+      "reason": "왜 추천인지 2~3문장"
+    }}
+  ]
+}}
 
 중요 규칙:
 - matched_conditions는 '사용자가 말한 조건'에서만 뽑아라.
@@ -176,6 +217,7 @@ def rerank_and_format(conditions, places):
 - 해시태그는 4~6개
 - 과장 금지 ('무조건', '최고', '완벽' 금지)
 - 후보 데이터 기반으로만 말하기 (없는 정보 상상 금지)
+- picks는 반드시 3개만
 
 [사용자 조건]
 {json.dumps(conditions, ensure_ascii=False, indent=2)}
@@ -184,16 +226,43 @@ def rerank_and_format(conditions, places):
 {json.dumps(compact, ensure_ascii=False, indent=2)}
 """
 
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.45
-    )
+    def call_llm(extra_msg=None, temp=0.3):
+        msgs = [{"role": "user", "content": prompt}]
+        if extra_msg:
+            msgs.append({"role": "user", "content": extra_msg})
+        return client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=msgs,
+            temperature=temp,
+            response_format={"type": "json_object"},
+        )
 
-    try:
-        return json.loads(res.choices[0].message.content.strip())
-    except:
+    # 1차
+    res = call_llm(temp=0.35)
+    raw = (res.choices[0].message.content or "").strip()
+    st.session_state.last_rerank_raw = raw
+
+    data = safe_json_load(raw) or extract_first_json_object(raw)
+
+    # 1회 재시도
+    if data is None or "picks" not in data:
+        res2 = call_llm(
+            extra_msg="방금 출력이 스키마를 안 지켰어. 위 스키마 그대로 JSON만 다시 출력해.",
+            temp=0.1
+        )
+        raw2 = (res2.choices[0].message.content or "").strip()
+        st.session_state.last_rerank_raw = raw2  # 최신으로 덮어쓰기
+        data = safe_json_load(raw2) or extract_first_json_object(raw2)
+
+    if not isinstance(data, dict):
         return []
+
+    picks = data.get("picks", [])
+    if not isinstance(picks, list):
+        return []
+
+    # 혹시 모델이 3개 이상/이하 주면 안전하게 3개로 슬라이스
+    return picks[:3]
 
 # -----------------------------
 # 5) 추천 시작 멘트 생성
@@ -224,7 +293,7 @@ def generate_pre_recommend_text(conditions, query):
         messages=[{"role": "user", "content": prompt}],
         temperature=0.85
     )
-    return res.choices[0].message.content.strip()
+    return (res.choices[0].message.content or "").strip()
 
 # -----------------------------
 # Chat UI
@@ -254,6 +323,9 @@ if user_input:
         # 디버그용(원하면 주석 처리)
         with st.expander("🧾 추출된 조건(JSON)"):
             st.json(conditions)
+            if debug_mode and st.session_state.last_extract_raw:
+                st.markdown("**(디버그) extract 원문**")
+                st.code(st.session_state.last_extract_raw)
 
         # 2) 아직 추천 못하면 친구톤으로 추가 질문
         if not conditions.get("ready_to_recommend", False):
@@ -267,7 +339,11 @@ if user_input:
         pre_text = generate_pre_recommend_text(conditions, query)
         st.markdown(pre_text)
 
-        places = kakao_keyword_search(query, kakao_key, size=15)
+        try:
+            places = kakao_keyword_search(query, kakao_key, size=15)
+        except Exception as e:
+            st.error(f"Kakao 검색 중 오류: {e}")
+            st.stop()
 
         if not places:
             msg = "헉… 이 조건으로는 딱 맞는 데가 잘 안 잡히네 🥲\n지역을 조금만 넓혀볼까?"
@@ -275,11 +351,26 @@ if user_input:
             st.session_state.messages.append({"role": "assistant", "content": msg})
             st.stop()
 
+        # (디버그) 카카오 후보 확인
+        if debug_mode:
+            with st.expander("🗺️ (디버그) Kakao 후보 15개"):
+                st.json([{
+                    "id": p.get("id"),
+                    "name": p.get("place_name"),
+                    "category": p.get("category_name"),
+                    "address": p.get("road_address_name") or p.get("address_name"),
+                } for p in places[:15]])
+
         # 4) 후보 -> BEST3 + 설명/키워드 생성
         picks = rerank_and_format(conditions, places)
 
+        # (디버그) rerank 원문 출력
+        if debug_mode:
+            with st.expander("🤖 (디버그) rerank LLM 원문"):
+                st.code(st.session_state.last_rerank_raw or "")
+
         if not picks:
-            msg = "후보는 찾았는데… 정리하다가 살짝 꼬였어 😅\n한 번만 더 말해줄래?"
+            msg = "후보는 찾았는데… 정리하다가 살짝 꼬였어 😅\n(디버그 모드 켜져 있으면 rerank 원문 확인 가능!)\n한 번만 더 말해줄래?"
             st.markdown(msg)
             st.session_state.messages.append({"role": "assistant", "content": msg})
             st.stop()
@@ -292,6 +383,10 @@ if user_input:
         cols = st.columns(3)
 
         for i, pick in enumerate(picks[:3]):
+            # pick이 dict인지, id가 있는지 방어
+            if not isinstance(pick, dict) or "id" not in pick:
+                continue
+
             place = kakao_map.get(pick["id"])
             if not place:
                 continue
