@@ -1,2 +1,2 @@
 streamlit
-openaistreamlit run app.py
+openai
