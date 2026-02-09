@@ -15,9 +15,8 @@ st.sidebar.header("🔑 API 설정")
 openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
 kakao_key = st.sidebar.text_input("Kakao Local REST API Key", type="password")
 
-# 디버그 옵션
 st.sidebar.markdown("---")
-debug_mode = st.sidebar.checkbox("🛠️ 디버그 모드(LLM 원문 출력)", value=True)
+debug_mode = st.sidebar.checkbox("🛠️ 디버그 모드(LLM 원문 출력)", value=False)
 
 client = OpenAI(api_key=openai_key) if openai_key else None
 
@@ -32,14 +31,31 @@ if "messages" not in st.session_state:
         }
     ]
 
-if "last_conditions" not in st.session_state:
-    st.session_state.last_conditions = {}
+# 누적 조건(핵심)
+if "conditions" not in st.session_state:
+    st.session_state.conditions = {
+        "location": None,
+        "food_type": None,
+        "purpose": None,
+        "people": None,
+        "mood": None,
+        "constraints": {
+            "cannot_eat": [],
+            "avoid_recent": [],
+            "need_parking": None
+        }
+    }
 
-if "last_rerank_raw" not in st.session_state:
-    st.session_state.last_rerank_raw = ""
+# 마지막 추천했던 place id들(다음 추천에서 제외)
+if "last_picks_ids" not in st.session_state:
+    st.session_state.last_picks_ids = []
 
-if "last_extract_raw" not in st.session_state:
-    st.session_state.last_extract_raw = ""
+# 디버그용 raw 저장
+if "debug_raw_patch" not in st.session_state:
+    st.session_state.debug_raw_patch = ""
+
+if "debug_raw_rerank" not in st.session_state:
+    st.session_state.debug_raw_rerank = ""
 
 # -----------------------------
 # Helpers: robust JSON parsing
@@ -51,15 +67,62 @@ def safe_json_load(text: str):
         return None
 
 def extract_first_json_object(text: str):
-    """
-    LLM이 JSON 앞뒤로 말을 붙여도, 가장 그럴듯한 JSON object를 뽑아내는 안전장치.
-    - response_format이 먹히면 필요 없지만, 예외 상황 대비.
-    """
-    # 가장 큰 { ... } 덩어리 찾기
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
         return None
     return safe_json_load(m.group(0))
+
+def normalize_conditions(cond: dict):
+    """
+    조건 dict 구조를 항상 안정적으로 유지하기 위한 방어.
+    """
+    if not isinstance(cond, dict):
+        return
+
+    if "constraints" not in cond or not isinstance(cond["constraints"], dict):
+        cond["constraints"] = {
+            "cannot_eat": [],
+            "avoid_recent": [],
+            "need_parking": None
+        }
+
+    c = cond["constraints"]
+
+    if "cannot_eat" not in c or not isinstance(c["cannot_eat"], list):
+        c["cannot_eat"] = []
+    if "avoid_recent" not in c or not isinstance(c["avoid_recent"], list):
+        c["avoid_recent"] = []
+    if "need_parking" not in c:
+        c["need_parking"] = None
+
+def merge_conditions(base: dict, patch: dict):
+    """
+    patch는 '변경된 값만' 들어있는 dict.
+    None은 덮어쓰기하지 않음(= 언급 안 된 것으로 처리)
+    리스트는 덮어쓰기(사용자가 '해산물 빼줘'처럼 바꾼 케이스)
+    """
+    if not isinstance(patch, dict):
+        return base
+
+    # constraints merge
+    if "constraints" in patch and isinstance(patch["constraints"], dict):
+        base_constraints = base.get("constraints", {}) or {}
+        for k, v in patch["constraints"].items():
+            if v is None:
+                continue
+            base_constraints[k] = v
+        base["constraints"] = base_constraints
+
+    # top-level merge
+    for k, v in patch.items():
+        if k == "constraints":
+            continue
+        if v is None:
+            continue
+        base[k] = v
+
+    normalize_conditions(base)
+    return base
 
 # -----------------------------
 # Kakao API
@@ -74,57 +137,85 @@ def kakao_keyword_search(query: str, kakao_rest_key: str, size: int = 15):
     return res.json().get("documents", [])
 
 # -----------------------------
-# 1) 대화 -> 조건 추출(JSON)
+# 1) 최신 발화 -> 조건 PATCH 추출(JSON)
 # -----------------------------
-def extract_conditions(messages):
+def extract_conditions_patch(latest_user_text: str, current_conditions: dict):
+    """
+    대화 전체를 다시 읽게 하지 않고,
+    '지금 발화'에서 바뀐 값만 뽑는다.
+    """
     if client is None:
         return {}
 
     system = """
-너는 '결정 메이트'의 분석 엔진이다.
-대화 전체를 보고 식당 추천에 필요한 조건을 JSON으로 추출해라.
-반드시 JSON만 출력해라.
+너는 '결정 메이트'의 조건 업데이트 엔진이다.
 
-스키마:
+[목표]
+사용자의 '최신 발화'를 보고,
+기존 조건에서 변경/추가된 값만 JSON PATCH 형태로 출력해라.
+
+[중요]
+- 반드시 JSON 오브젝트만 출력해라.
+- 사용자가 언급하지 않은 필드는 출력하지 마라.
+- "null로 초기화" 같은 행동 금지.
+- constraints 안의 리스트는 사용자가 새로 언급한 경우에만 업데이트해라.
+- 사용자가 "아까 추천 말고 다른 데"라고 하면 diversify=true 를 넣어라.
+- 사용자가 "방금 추천한 데 제외" 같은 의미면 exclude_last=true 를 넣어라.
+
+PATCH 스키마 예시:
 {
-  "location": "지역명 또는 null",
-  "food_type": "음식 종류 또는 null",
-  "purpose": "목적 또는 null",
-  "people": "인원(숫자) 또는 null",
-  "mood": "분위기 또는 null",
+  "location": "합정",
+  "mood": "조용한",
   "constraints": {
-    "cannot_eat": ["못 먹는 음식"],
-    "avoid_recent": ["최근 먹어서 피하고 싶은 음식"],
-    "need_parking": true/false/null
+    "need_parking": true,
+    "cannot_eat": ["해산물"]
   },
-  "ready_to_recommend": true/false
+  "diversify": true,
+  "exclude_last": true
 }
 
-ready_to_recommend 기준:
-- location이 있고,
-- food_type 또는 mood 중 하나라도 있으면 true
+가능한 필드:
+- location, food_type, purpose, people, mood
+- constraints.cannot_eat (list[str])
+- constraints.avoid_recent (list[str])
+- constraints.need_parking (true/false)
+- diversify (true/false)
+- exclude_last (true/false)
 """
 
     res = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(messages, ensure_ascii=False)}
+            {"role": "user", "content": f"[기존 조건]\n{json.dumps(current_conditions, ensure_ascii=False)}"},
+            {"role": "user", "content": f"[최신 발화]\n{latest_user_text}"},
         ],
         temperature=0.2,
-        # 가능하면 JSON 강제 (object 형태라 잘 맞음)
         response_format={"type": "json_object"},
     )
 
     raw = (res.choices[0].message.content or "").strip()
-    st.session_state.last_extract_raw = raw
+    st.session_state.debug_raw_patch = raw
 
-    parsed = safe_json_load(raw) or extract_first_json_object(raw)
-    return parsed or {}
+    patch = safe_json_load(raw) or extract_first_json_object(raw)
+    if not isinstance(patch, dict):
+        return {}
+
+    return patch
 
 # -----------------------------
 # 2) 부족한 정보 질문 (친구톤)
 # -----------------------------
+def is_ready_to_recommend(conditions: dict):
+    """
+    기존 ready_to_recommend 기준을 코드로 안정적으로 구현.
+    """
+    if not conditions.get("location"):
+        return False
+    if conditions.get("food_type") or conditions.get("mood"):
+        return True
+    return False
+
 def generate_followup_question(conditions):
     if client is None:
         return "지역이랑 먹고 싶은 거만 말해줘! 내가 바로 찾아줄게 😎"
@@ -138,12 +229,12 @@ def generate_followup_question(conditions):
 현재 조건:
 {json.dumps(conditions, ensure_ascii=False, indent=2)}
 
-질문은 아래 중에서 상황에 맞게 골라서 섞어라:
-- 목적(데이트/회식/친구모임)
+질문 후보:
+- 음식 종류 (한식/양식/중식/일식/술집)
+- 분위기 (조용/시끌/데이트/가성비)
 - 인원
 - 주차 필요 여부
 - 못 먹는 음식
-- 조용한지/시끌벅적한지
 """
 
     res = client.chat.completions.create(
@@ -161,6 +252,7 @@ def build_query(conditions):
     if conditions.get("location"):
         tokens.append(conditions["location"])
 
+    # 음식종류 우선, 없으면 분위기
     if conditions.get("food_type"):
         tokens.append(conditions["food_type"])
     elif conditions.get("mood"):
@@ -171,18 +263,20 @@ def build_query(conditions):
     return " ".join(tokens).strip()
 
 # -----------------------------
-# 4) 후보 -> BEST3 재랭킹 + 키워드/근거 생성
-#   핵심 안정화 포인트:
-#   - output을 { "picks": [...] } object로 바꿈 (json_object 강제 가능)
-#   - response_format={"type":"json_object"} 사용
-#   - 파싱 실패 시 1회 자동 재시도
-#   - 마지막 방어로 {..} 덩어리 추출
+# 4) 후보 필터링(방금 추천 제외)
+# -----------------------------
+def filter_places(places, exclude_ids):
+    if not exclude_ids:
+        return places
+    return [p for p in places if p.get("id") not in set(exclude_ids)]
+
+# -----------------------------
+# 5) 후보 -> BEST3 재랭킹 + 근거 생성 (안정화 버전)
 # -----------------------------
 def rerank_and_format(conditions, places):
     if client is None:
         return []
 
-    # LLM에 넘길 후보를 간단히 줄임
     compact = []
     for p in places[:15]:
         compact.append({
@@ -197,7 +291,7 @@ def rerank_and_format(conditions, places):
 너는 '결정 메이트'다.
 사용자 조건에 맞춰 아래 후보 중 BEST 3곳만 골라라.
 
-반드시 아래 JSON 형식(오브젝트)으로만 출력해라:
+반드시 아래 JSON 형식으로만 출력해라:
 {{
   "picks": [
     {{
@@ -212,8 +306,7 @@ def rerank_and_format(conditions, places):
 
 중요 규칙:
 - matched_conditions는 '사용자가 말한 조건'에서만 뽑아라.
-  (예: '홍대', '3명', '가볍게 술', '해산물 제외', '데이트')
-- hashtags도 사용자 조건 기반으로 먼저 만들고, 부족하면 category로 보충해라.
+- hashtags는 사용자 조건 기반으로 먼저 만들고, 부족하면 category로 보충.
 - 해시태그는 4~6개
 - 과장 금지 ('무조건', '최고', '완벽' 금지)
 - 후보 데이터 기반으로만 말하기 (없는 정보 상상 금지)
@@ -237,21 +330,19 @@ def rerank_and_format(conditions, places):
             response_format={"type": "json_object"},
         )
 
-    # 1차
     res = call_llm(temp=0.35)
     raw = (res.choices[0].message.content or "").strip()
-    st.session_state.last_rerank_raw = raw
+    st.session_state.debug_raw_rerank = raw
 
     data = safe_json_load(raw) or extract_first_json_object(raw)
 
-    # 1회 재시도
     if data is None or "picks" not in data:
         res2 = call_llm(
-            extra_msg="방금 출력이 스키마를 안 지켰어. 위 스키마 그대로 JSON만 다시 출력해.",
+            extra_msg="방금 출력이 스키마를 안 지켰어. JSON만 다시 출력해.",
             temp=0.1
         )
         raw2 = (res2.choices[0].message.content or "").strip()
-        st.session_state.last_rerank_raw = raw2  # 최신으로 덮어쓰기
+        st.session_state.debug_raw_rerank = raw2
         data = safe_json_load(raw2) or extract_first_json_object(raw2)
 
     if not isinstance(data, dict):
@@ -261,11 +352,10 @@ def rerank_and_format(conditions, places):
     if not isinstance(picks, list):
         return []
 
-    # 혹시 모델이 3개 이상/이하 주면 안전하게 3개로 슬라이스
     return picks[:3]
 
 # -----------------------------
-# 5) 추천 시작 멘트 생성
+# 6) 추천 시작 멘트 생성
 # -----------------------------
 def generate_pre_recommend_text(conditions, query):
     if client is None:
@@ -316,25 +406,38 @@ if user_input:
             st.warning("사이드바에 OpenAI 키랑 Kakao 키부터 넣어줘!")
             st.stop()
 
-        # 1) 조건 추출
-        conditions = extract_conditions(st.session_state.messages)
-        st.session_state.last_conditions = conditions
+        # -----------------------------
+        # (핵심) 최신 발화에서 PATCH 추출 → 조건 merge
+        # -----------------------------
+        patch = extract_conditions_patch(user_input, st.session_state.conditions)
 
-        # 디버그용(원하면 주석 처리)
-        with st.expander("🧾 추출된 조건(JSON)"):
+        diversify = bool(patch.pop("diversify", False))
+        exclude_last = bool(patch.pop("exclude_last", False))
+
+        st.session_state.conditions = merge_conditions(st.session_state.conditions, patch)
+        conditions = st.session_state.conditions
+
+        # -----------------------------
+        # 디버그 출력
+        # -----------------------------
+        with st.expander("🧾 현재 누적 조건(JSON)"):
             st.json(conditions)
-            if debug_mode and st.session_state.last_extract_raw:
-                st.markdown("**(디버그) extract 원문**")
-                st.code(st.session_state.last_extract_raw)
+            if debug_mode:
+                st.markdown("**(디버그) patch 원문**")
+                st.code(st.session_state.debug_raw_patch)
 
-        # 2) 아직 추천 못하면 친구톤으로 추가 질문
-        if not conditions.get("ready_to_recommend", False):
+        # -----------------------------
+        # 조건 부족하면 follow-up
+        # -----------------------------
+        if not is_ready_to_recommend(conditions):
             q = generate_followup_question(conditions)
             st.markdown(q)
             st.session_state.messages.append({"role": "assistant", "content": q})
             st.stop()
 
-        # 3) Kakao 검색
+        # -----------------------------
+        # Kakao 검색
+        # -----------------------------
         query = build_query(conditions)
         pre_text = generate_pre_recommend_text(conditions, query)
         st.markdown(pre_text)
@@ -351,30 +454,35 @@ if user_input:
             st.session_state.messages.append({"role": "assistant", "content": msg})
             st.stop()
 
-        # (디버그) 카카오 후보 확인
-        if debug_mode:
-            with st.expander("🗺️ (디버그) Kakao 후보 15개"):
-                st.json([{
-                    "id": p.get("id"),
-                    "name": p.get("place_name"),
-                    "category": p.get("category_name"),
-                    "address": p.get("road_address_name") or p.get("address_name"),
-                } for p in places[:15]])
+        # -----------------------------
+        # (핵심) '다른 데 추천해줘' 요청 처리
+        # -----------------------------
+        if diversify or exclude_last:
+            places = filter_places(places, st.session_state.last_picks_ids)
 
-        # 4) 후보 -> BEST3 + 설명/키워드 생성
+        # 후보가 너무 줄어들면 안전장치: 제외 풀기
+        if len(places) < 6:
+            # 너무 적으면 다시 전체 후보로
+            places = kakao_keyword_search(query, kakao_key, size=15)
+
+        # -----------------------------
+        # rerank
+        # -----------------------------
         picks = rerank_and_format(conditions, places)
 
-        # (디버그) rerank 원문 출력
         if debug_mode:
             with st.expander("🤖 (디버그) rerank LLM 원문"):
-                st.code(st.session_state.last_rerank_raw or "")
+                st.code(st.session_state.debug_raw_rerank)
 
         if not picks:
-            msg = "후보는 찾았는데… 정리하다가 살짝 꼬였어 😅\n(디버그 모드 켜져 있으면 rerank 원문 확인 가능!)\n한 번만 더 말해줄래?"
+            msg = "후보는 찾았는데… 정리하다가 살짝 꼬였어 😅\n한 번만 더 말해줄래?"
             st.markdown(msg)
             st.session_state.messages.append({"role": "assistant", "content": msg})
             st.stop()
 
+        # -----------------------------
+        # 렌더링
+        # -----------------------------
         kakao_map = {p.get("id"): p for p in places}
 
         st.markdown("---")
@@ -382,14 +490,18 @@ if user_input:
 
         cols = st.columns(3)
 
+        # 이번 추천 id 저장(다음에 제외하기 위해)
+        current_pick_ids = []
+
         for i, pick in enumerate(picks[:3]):
-            # pick이 dict인지, id가 있는지 방어
             if not isinstance(pick, dict) or "id" not in pick:
                 continue
 
             place = kakao_map.get(pick["id"])
             if not place:
                 continue
+
+            current_pick_ids.append(pick["id"])
 
             with cols[i]:
                 name = place.get("place_name")
@@ -401,27 +513,26 @@ if user_input:
                 st.caption(category or "")
                 st.write(f"📍 {addr}")
 
-                # 한줄 소개
                 st.markdown(f"**{pick.get('one_line','')}**")
 
-                # 🔥 반영된 조건(키워드) 표시
                 matched = pick.get("matched_conditions", [])
                 if matched:
                     st.markdown("**반영한 조건**")
                     st.markdown(" · ".join([f"`{m}`" for m in matched]))
 
-                # 해시태그
                 tags = pick.get("hashtags", [])
                 if tags:
                     st.markdown(" ".join(tags))
 
-                # 추천 이유
                 st.markdown("**왜 여기냐면…**")
                 st.write(pick.get("reason", ""))
 
                 if url:
                     st.link_button("카카오맵에서 보기", url)
 
-        final = "끝! 😎\n셋 중에 지금 제일 끌리는 데 하나만 골라봐. 아니면 내가 더 좁혀줄까?"
+        # 다음 추천에서 제외할 수 있도록 저장
+        st.session_state.last_picks_ids = current_pick_ids
+
+        final = "끝! 😎\n셋 중에 하나 고르거나, '더 조용한 데', '주차 되는 데', '완전 다른 스타일' 이런 식으로 다시 시켜도 돼."
         st.session_state.messages.append({"role": "assistant", "content": final})
         st.markdown(final)
