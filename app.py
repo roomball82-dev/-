@@ -1,12 +1,16 @@
+# decision_mate_app.py
 import json
 import re
+import time
+import math
 import requests
 import streamlit as st
 from openai import OpenAI
+from math import radians, sin, cos, sqrt, atan2
 
 st.set_page_config(page_title="결정 메이트", page_icon="🍽️", layout="wide")
 st.title("🍽️ 결정 메이트 (Decision Mate)")
-st.caption("식당 잘 아는 친구처럼, 대화로 조건을 정리하고 3곳만 딱 추천해주는 챗봇")
+st.caption("식당/카페/술집… ‘장소 픽스’가 필요할 때, 조건 정리 + 3곳만 딱 추천")
 
 # -----------------------------
 # Sidebar
@@ -24,12 +28,10 @@ client = OpenAI(api_key=openai_key) if openai_key else None
 # Session State
 # -----------------------------
 if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": "오케이 😎\n오늘 어디서 누구랑 뭐 먹을지 내가 딱 정해줄게.\n일단 **어느 동네 근처**에서 찾을까?"
-        }
-    ]
+    st.session_state.messages = [{
+        "role": "assistant",
+        "content": "오케이 😎\n오늘 어디서 누구랑 뭐 먹을지 내가 딱 정해줄게.\n일단 **어느 동네/역 근처**에서 찾을까?"
+    }]
 
 if "conditions" not in st.session_state:
     st.session_state.conditions = {
@@ -47,16 +49,18 @@ if "conditions" not in st.session_state:
             "context_mode": None,       # 회사 회식 / 친구 / 단체 모임 / 연인 · 썸 · 소개팅 / 혼밥 / 가족 / None
             "people_count": None,       # int
             "budget_tier": "상관없음",  # 가성비 / 보통 / 조금 특별 / 상관없음
-            "answers": {},              # 모드/추가 질문 답 저장
-            "common": {                 # 공통 질문 답 저장
-                "cannot_eat_done": False,   # True/False (없음이라도 질문 1회 완료)
+            "answers": {},              # 모드 질문 답
+            "common": {
+                "cannot_eat_done": False,   # 못 먹는 것 질문 완료 여부
                 "alcohol_level": None,      # 없음 / 가볍게 / 술 중심
                 "stay_duration": None,      # 빠르게 / 적당히 / 오래
                 "transport": None,          # 차 / 대중교통 / 상관없음
-                "alcohol_plan": None,       # (술 중심일 때만) 한 곳 / 나눌 수도 / 모르겠음
-                "alcohol_type": None,       # (필요 시) 소주/맥주/와인/상관없음
+                "alcohol_plan": None,       # (술 중심) 한 곳 / 나눌 수도 / 모르겠음
+                "alcohol_type": None,       # (술 중심) 소주/맥주/와인/상관없음
+                "search_relax": 0,          # 0~3: 검색 토큰 완화
+                "center_name": None,        # 예: "신촌역"
             },
-            "fast_mode": False          # "그냥 추천해" 등 스킵 의도
+            "fast_mode": False           # "그냥 추천해" 스킵 의도
         }
     }
 
@@ -71,6 +75,9 @@ if "debug_raw_patch" not in st.session_state:
 
 if "debug_raw_rerank" not in st.session_state:
     st.session_state.debug_raw_rerank = ""
+
+if "loc_center_cache" not in st.session_state:
+    st.session_state.loc_center_cache = {}  # {"신촌": {"x":..,"y":..,"name":..}}
 
 # -----------------------------
 # Helpers
@@ -115,6 +122,8 @@ def normalize_conditions(cond: dict):
                 "transport": None,
                 "alcohol_plan": None,
                 "alcohol_type": None,
+                "search_relax": 0,
+                "center_name": None,
             },
             "fast_mode": False
         }
@@ -136,20 +145,27 @@ def normalize_conditions(cond: dict):
             "transport": None,
             "alcohol_plan": None,
             "alcohol_type": None,
+            "search_relax": 0,
+            "center_name": None,
         }
     if "fast_mode" not in m:
         m["fast_mode"] = False
 
     cm = m["common"]
-    for k in ["cannot_eat_done", "alcohol_level", "stay_duration", "transport", "alcohol_plan", "alcohol_type"]:
+    for k in ["cannot_eat_done", "alcohol_level", "stay_duration", "transport",
+              "alcohol_plan", "alcohol_type", "search_relax", "center_name"]:
         if k not in cm:
-            cm[k] = False if k == "cannot_eat_done" else None
+            if k == "cannot_eat_done":
+                cm[k] = False
+            elif k == "search_relax":
+                cm[k] = 0
+            else:
+                cm[k] = None
 
 def merge_conditions(base: dict, patch: dict):
     if not isinstance(patch, dict):
         return base
 
-    # constraints merge
     if "constraints" in patch and isinstance(patch["constraints"], dict):
         base_constraints = base.get("constraints", {}) or {}
         for k, v in patch["constraints"].items():
@@ -158,7 +174,6 @@ def merge_conditions(base: dict, patch: dict):
             base_constraints[k] = v
         base["constraints"] = base_constraints
 
-    # meta merge (부분 업데이트만 허용)
     if "meta" in patch and isinstance(patch["meta"], dict):
         base_meta = base.get("meta", {}) or {}
         for k, v in patch["meta"].items():
@@ -167,7 +182,6 @@ def merge_conditions(base: dict, patch: dict):
             base_meta[k] = v
         base["meta"] = base_meta
 
-    # top-level merge
     for k, v in patch.items():
         if k in ("constraints", "meta"):
             continue
@@ -183,6 +197,13 @@ def detect_skip_intent(text: str) -> bool:
     if not t:
         return False
     keywords = ["그냥 추천", "걍 추천", "빨리 추천", "스킵", "아무거나", "됐고 추천", "바로 추천", "추천해줘"]
+    return any(k in t for k in keywords)
+
+def detect_expand_intent(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    keywords = ["넓혀", "넓혀봐", "범위", "주변", "근처로", "조금만 넓혀"]
     return any(k in t for k in keywords)
 
 # -----------------------------
@@ -224,6 +245,119 @@ def kakao_keyword_search(query: str, kakao_rest_key: str, size: int = 15):
     return res.json().get("documents", [])
 
 # -----------------------------
+# Geo / Walk / Transport scoring
+# -----------------------------
+def haversine_m(x1, y1, x2, y2):
+    lon1, lat1, lon2, lat2 = map(radians, [float(x1), float(y1), float(x2), float(y2)])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    return 6371000 * c
+
+def estimate_walk_minutes(distance_m: float, speed_m_per_min: float = 80.0) -> int:
+    if distance_m is None:
+        return 999
+    if distance_m >= 10**11:
+        return 999
+    return max(1, int(math.ceil(distance_m / speed_m_per_min)))
+
+def place_distance_m(place: dict, center: dict):
+    if not center or not center.get("x") or not center.get("y"):
+        return None
+    px, py = place.get("x"), place.get("y")
+    if not px or not py:
+        return None
+    return haversine_m(center["x"], center["y"], px, py)
+
+def get_location_center(location: str, kakao_rest_key: str):
+    """
+    location이 '동네'면 '동네역'을 우선 시도해서 중심좌표를 잡는다.
+    캐시 사용.
+    """
+    loc = (location or "").strip()
+    if not loc:
+        return None
+
+    cache = st.session_state.loc_center_cache
+    if loc in cache:
+        return cache[loc]
+
+    candidates = []
+    if "역" in loc:
+        candidates.append(loc)
+    else:
+        candidates.append(f"{loc}역")
+        candidates.append(loc)
+
+    for cand in candidates:
+        try:
+            docs = kakao_keyword_search(cand, kakao_rest_key, size=1)
+            if not docs:
+                continue
+            d = docs[0]
+            center = {"x": d.get("x"), "y": d.get("y"), "name": cand}
+            if center["x"] and center["y"]:
+                cache[loc] = center
+                return center
+        except Exception:
+            continue
+
+    return None
+
+def filter_places_by_radius(places: list, center: dict, radius_m: int):
+    if not center or not center.get("x") or not center.get("y"):
+        return places
+    cx, cy = center["x"], center["y"]
+
+    out = []
+    for p in places:
+        px, py = p.get("x"), p.get("y")
+        if not px or not py:
+            continue
+        if haversine_m(cx, cy, px, py) <= radius_m:
+            out.append(p)
+    return out
+
+def parking_signal_score(place: dict) -> int:
+    text = f"{place.get('place_name','')} {place.get('category_name','')}".lower()
+    score = 0
+    if "주차" in text or "parking" in text or "발렛" in text:
+        score += 3
+    big_like = ["백화점", "몰", "아울렛", "호텔", "리조트", "웨딩", "컨벤션", "대형"]
+    if any(k in text for k in big_like):
+        score += 1
+    alley_like = ["포차", "호프", "이자카야", "바", "주점"]
+    if any(k in text for k in alley_like):
+        score -= 1
+    return score
+
+def sort_places_for_transport(places: list, center: dict, transport: str):
+    """
+    - 대중교통: 거리 우선
+    - 차: 거리 + 주차시그널 약가점
+    """
+    if not center or not center.get("x") or not center.get("y"):
+        return places
+
+    cx, cy = center["x"], center["y"]
+    scored = []
+
+    for p in places:
+        px, py = p.get("x"), p.get("y")
+        if px and py:
+            dist = haversine_m(cx, cy, px, py)
+        else:
+            dist = 10**12
+
+        park = parking_signal_score(p) if transport == "차" else 0
+        score = dist - (park * 120)  # 주차점수 1당 120m 정도 이득 (너무 과해지지 않게 약하게)
+        scored.append((score, dist, p))
+
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [p for _, __, p in scored]
+
+# -----------------------------
 # 1) 최신 발화 -> 조건 PATCH 추출(JSON)
 # -----------------------------
 def extract_conditions_patch(latest_user_text: str, current_conditions: dict):
@@ -244,18 +378,6 @@ def extract_conditions_patch(latest_user_text: str, current_conditions: dict):
 - constraints 안의 리스트는 사용자가 새로 언급한 경우에만 업데이트해라.
 - 사용자가 "아까 추천 말고 다른 데"라고 하면 diversify=true 를 넣어라.
 - 사용자가 "방금 추천한 데 제외" 같은 의미면 exclude_last=true 를 넣어라.
-
-PATCH 스키마 예시:
-{
-  "location": "합정",
-  "mood": "조용한",
-  "constraints": {
-    "need_parking": true,
-    "cannot_eat": ["해산물"]
-  },
-  "diversify": true,
-  "exclude_last": true
-}
 
 가능한 필드:
 - location, food_type, purpose, people, mood
@@ -324,31 +446,25 @@ def get_next_common_question(conditions: dict):
     normalize_conditions(conditions)
     cm = conditions["meta"]["common"]
 
-    # 0) 위치 없으면 항상 먼저
     if not conditions.get("location"):
-        return {"scope": "common", "key": "location", "text": "오케이! **어느 동네 근처**에서 찾을까? 📍", "type": "free"}
+        return {"scope": "common", "key": "location", "text": "오케이! **어느 동네/역 근처**에서 찾을까? 📍", "type": "free"}
 
-    # 1) 못 먹는 것 (1회 필수)
     if not cm.get("cannot_eat_done", False):
         return {"scope": "common", "key": "cannot_eat", "text": "못 먹는 거 있어? (알레르기/극혐 포함) 없으면 **없음**이라고 해줘 🙅", "type": "list_or_none"}
 
-    # 스킵이면 여기서 공통 질문 중단
+    # 스킵이면(사용자 강제 진행) 남은 공통 질문은 생략
     if conditions["meta"].get("fast_mode"):
         return None
 
-    # 2) 술 여부
     if cm.get("alcohol_level") is None:
         return {"scope": "common", "key": "alcohol_level", "text": "오늘 술은 어때? **없음 / 가볍게 / 술 중심** 🍻", "type": "enum_alcohol"}
 
-    # 3) 체류 시간
     if cm.get("stay_duration") is None:
         return {"scope": "common", "key": "stay_duration", "text": "얼마나 있을 거야? **빠르게 / 적당히 / 오래** ⏱️", "type": "enum_stay"}
 
-    # 4) 이동수단
     if cm.get("transport") is None:
         return {"scope": "common", "key": "transport", "text": "이동수단은 뭐야? **차 / 대중교통 / 상관없음** 🧭", "type": "enum_transport"}
 
-    # 5) 술 중심이면 (조건부) 1차/2차 의향
     if cm.get("alcohol_level") == "술 중심" and cm.get("alcohol_plan") is None:
         return {
             "scope": "common",
@@ -357,7 +473,6 @@ def get_next_common_question(conditions: dict):
             "type": "enum_alcohol_plan"
         }
 
-    # 6) 술 중심 + 나눌 수도(or 한 곳)일 때만 주종
     if cm.get("alcohol_level") == "술 중심" and cm.get("alcohol_plan") in ("한 곳", "나눌 수도") and cm.get("alcohol_type") is None:
         return {
             "scope": "common",
@@ -369,7 +484,6 @@ def get_next_common_question(conditions: dict):
     return None
 
 def get_next_question(conditions: dict):
-    # 공통 먼저, 그 다음 모드
     q = get_next_common_question(conditions)
     if q:
         return q
@@ -384,14 +498,12 @@ def parse_list_or_none(text: str):
         return None
     if "없" in t:
         return []
-    # 쉼표/슬래시/공백 기반 분리
     parts = re.split(r"[,\n/]+", t)
     out = []
     for p in parts:
         p = p.strip()
         if not p:
             continue
-        # 조사/불필요 단어 조금 제거
         p = re.sub(r"(은|는|이|가|을|를|만|빼고|빼줘)$", "", p).strip()
         if p and p not in out:
             out.append(p)
@@ -403,12 +515,17 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     cm = conditions["meta"]["common"]
     answers = conditions["meta"]["answers"]
 
+    # ✅ 어떤 질문 중이든 "술 안 마셔/안 먹어"면 상위 상태를 먼저 갱신 (무한 루프 방지)
+    if any(x in t for x in ["술 안", "술안", "안 마셔", "안먹", "안 먹", "금주", "노알콜", "노 알콜"]):
+        cm["alcohol_level"] = "없음"
+        cm["alcohol_plan"] = None
+        cm["alcohol_type"] = None
+        return True
+
     key = pending_q.get("key")
     qtype = pending_q.get("type")
 
-    # location
     if key == "location":
-        # 사용자가 동네를 말했으면 그대로 저장 (LLM patch도 같이 돌지만, 최소 방어)
         if len(t) >= 1:
             conditions["location"] = t
             return True
@@ -426,7 +543,7 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
         if "없" in t:
             cm["alcohol_level"] = "없음"
             return True
-        if "가볍" in t or "한두" in t or "1" in t:
+        if "가볍" in t or "한두" in t:
             cm["alcohol_level"] = "가볍게"
             return True
         if "술" in t or "제대로" in t or "중심" in t:
@@ -462,7 +579,7 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
         if "한" in t and "곳" in t:
             cm["alcohol_plan"] = "한 곳"
             return True
-        if "나눌" in t or "1" in t or "2" in t:
+        if "나눌" in t or ("1" in t and "2" in t):
             cm["alcohol_plan"] = "나눌 수도"
             return True
         if "모르" in t or "아직" in t:
@@ -485,7 +602,6 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
             return True
         return False
 
-    # mode enum (룰 기반 간단 저장)
     if pending_q.get("scope") == "mode":
         k = key
         maps = {
@@ -509,14 +625,11 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     return False
 
 # -----------------------------
-# Kakao 검색어 만들기 (카페/술집 포함)
+# Kakao 검색어 만들기 (relax 0~3)
 # -----------------------------
 def build_query(conditions):
     normalize_conditions(conditions)
     tokens = []
-    loc = conditions.get("location")
-    if loc:
-        tokens.append(loc)
 
     mode = conditions["meta"].get("context_mode")
     budget = conditions["meta"].get("budget_tier")
@@ -524,45 +637,76 @@ def build_query(conditions):
 
     alcohol = cm.get("alcohol_level")
     stay = cm.get("stay_duration")
-    transport = cm.get("transport")
     alcohol_type = cm.get("alcohol_type")
+    relax = int(cm.get("search_relax", 0) or 0)
 
-    # 장소 타입 토큰(가장 중요)
+    loc = conditions.get("location")
+    if loc:
+        tokens.append(loc)
+
+    # 장소 타입 토큰
     if alcohol in ("가볍게", "술 중심"):
-        # 술 중심이면 주종에 따라 조금 더 구체화
         if alcohol_type == "와인":
-            tokens.append("와인바")
+            place_token = "와인바"
         elif alcohol_type == "맥주":
-            tokens.append("펍")
+            place_token = "펍"
         elif alcohol_type == "소주":
+            place_token = "술집"
+        else:
+            place_token = "술집"
+    else:
+        if stay == "오래":
+            place_token = "카페"
+        elif stay == "빠르게":
+            place_token = "식사"
+        else:
+            place_token = "맛집"
+
+    if relax == 0:
+        tokens.append(place_token)
+        if mode == "회사 회식":
+            tokens.append("회식")
+        elif mode == "가족":
+            tokens.append("가족식사")
+        elif mode == "연인 · 썸 · 소개팅":
+            tokens.append("데이트")
+        elif mode == "단체 모임":
+            tokens.append("단체")
+        if budget == "가성비":
+            tokens.append("가성비")
+
+    elif relax == 1:
+        tokens.append(place_token)
+
+    elif relax == 2:
+        if place_token in ("와인바", "펍"):
             tokens.append("술집")
         else:
+            tokens.append(place_token)
+
+    else:  # relax >= 3
+        if alcohol in ("가볍게", "술 중심"):
             tokens.append("술집")
-    else:
-        # 술 없음
-        if stay == "오래":
-            tokens.append("카페")
-        elif stay == "빠르게":
-            tokens.append("식사")
         else:
             tokens.append("맛집")
 
-    # 모드에 따른 보조 토큰 (과하지 않게)
-    if mode == "회사 회식":
-        tokens.append("회식")
-    elif mode == "가족":
-        tokens.append("가족식사")
-    elif mode == "연인 · 썸 · 소개팅":
-        tokens.append("데이트")
-    elif mode == "단체 모임":
-        tokens.append("단체")
-
-    # 예산대는 검색어에 과하게 넣으면 잡음이 늘어서 v1은 최소만
-    if budget == "가성비":
-        tokens.append("가성비")
-
-    # 교통은 키워드로 넣으면 잡음이 커서 v1은 프롬프트에서 처리(거리 데이터 없어서)
     return " ".join([t for t in tokens if t]).strip()
+
+def make_query_variants(base_query: str, location: str, relax_level: int):
+    qs = []
+    if relax_level >= 1 and location:
+        stripped = base_query.replace(location, "").strip()
+        qs.append(f"{location} 근처 {stripped}".strip())
+        qs.append(f"{location} 주변 {stripped}".strip())
+    qs.append(base_query)
+
+    out, seen = [], set()
+    for q in qs:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out
 
 # -----------------------------
 # 후보 필터링(방금 추천 제외)
@@ -573,14 +717,15 @@ def filter_places(places, exclude_ids):
     return [p for p in places if p.get("id") not in set(exclude_ids)]
 
 # -----------------------------
-# BEST3 재랭킹 + 근거 생성 (scene_feel 포함)
-# + 술 중심 & 1/2차 분리 지원(조건부)
+# rerank + formatting (scene_feel + walk_min/distance_m 포함)
 # -----------------------------
 def rerank_and_format(conditions, places):
     if client is None:
         return []
 
     normalize_conditions(conditions)
+    cm = conditions["meta"]["common"]
+    split_12 = (cm.get("alcohol_level") == "술 중심" and cm.get("alcohol_plan") == "나눌 수도")
 
     compact = []
     for p in places[:15]:
@@ -590,10 +735,9 @@ def rerank_and_format(conditions, places):
             "category": p.get("category_name"),
             "address": p.get("road_address_name") or p.get("address_name"),
             "url": p.get("place_url"),
+            "walk_min": p.get("_walk_min"),
+            "distance_m": p.get("_distance_m"),
         })
-
-    cm = conditions["meta"]["common"]
-    split_12 = (cm.get("alcohol_level") == "술 중심" and cm.get("alcohol_plan") == "나눌 수도")
 
     schema_hint = """
 반드시 아래 JSON 형식으로만 출력해라:
@@ -638,6 +782,7 @@ def rerank_and_format(conditions, places):
 - 후보 데이터 기반으로만 말하기 (없는 정보 상상 금지)
 - picks는 반드시 3개만
 - scene_feel은 "자리 배치/조명/동선" 같은 디테일 설명하지 말고, "체감"만 2~3문장으로.
+- 가능하면 (특히 대중교통일 때) walk_min이 너무 큰 후보는 피하되, 조건 적합성이 더 중요하면 예외 가능.
 
 {extra_rules}
 
@@ -680,7 +825,7 @@ def rerank_and_format(conditions, places):
     return picks[:3]
 
 # -----------------------------
-# 추천 시작 멘트 생성
+# 추천 시작 멘트
 # -----------------------------
 def generate_pre_recommend_text(conditions, query):
     if client is None:
@@ -702,7 +847,6 @@ def generate_pre_recommend_text(conditions, query):
 - 리액션 포함
 - 이모지 1개 정도
 """
-
     res = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}],
@@ -732,24 +876,29 @@ if user_input:
 
         normalize_conditions(st.session_state.conditions)
         conditions = st.session_state.conditions
+        cm = conditions["meta"]["common"]
 
-        # 0) 스킵 의도 처리 ("그냥 추천해" 등)
+        # 0) 스킵 의도 처리
         if detect_skip_intent(user_input):
             conditions["meta"]["fast_mode"] = True
 
-        # 1) pending question이 있으면 먼저 답변 적용 시도
+        # 0-1) 사용자 요청으로 relax 올리기
+        if detect_expand_intent(user_input):
+            cm["search_relax"] = min(3, int(cm.get("search_relax", 0)) + 1)
+
+        # 1) pending question 답변 우선 적용
         if st.session_state.pending_question is not None:
             ok = apply_answer(conditions, st.session_state.pending_question, user_input)
             if ok:
-                st.session_state.pending_question = None  # 질문 해결
-            # 답변이었어도, 사용자가 동시에 location/조건을 말했을 수 있으니 patch도 같이 돌림
+                st.session_state.pending_question = None
 
-        # 2) PATCH 추출 → merge (조건 업데이트)
+        # 2) PATCH 추출 → merge
         patch = extract_conditions_patch(user_input, conditions)
         diversify = bool(patch.pop("diversify", False))
         exclude_last = bool(patch.pop("exclude_last", False))
         st.session_state.conditions = merge_conditions(conditions, patch)
         conditions = st.session_state.conditions
+        cm = conditions["meta"]["common"]
 
         # 디버그 출력
         with st.expander("🧾 현재 누적 조건(JSON)"):
@@ -758,63 +907,144 @@ if user_input:
                 st.markdown("**(디버그) patch 원문**")
                 st.code(st.session_state.debug_raw_patch)
 
-        # 3) 다음 질문이 있으면(대화형) 먼저 질문
+        # 3) 다음 질문
         next_q = get_next_question(conditions)
 
-        # 스킵 모드라도 location 없으면 location은 물어야 함
-        if next_q and not (conditions["meta"].get("fast_mode") and next_q.get("key") != "location" and next_q.get("key") != "cannot_eat"):
-            # 다음 질문 출력
+        # fast_mode라도 location/cannot_eat는 유지
+        if next_q and not (conditions["meta"].get("fast_mode") and next_q.get("key") not in ("location", "cannot_eat")):
             st.markdown(next_q["text"])
             st.session_state.messages.append({"role": "assistant", "content": next_q["text"]})
             st.session_state.pending_question = next_q
             st.stop()
 
-        # 4) 추천 진행 준비: location 없으면 안전하게 재질문
+        # 4) location 없으면 재질문
         if not conditions.get("location"):
-            msg = "좋아! 근데 **동네**부터 알려줘야 내가 뽑아주지 😎\n예: `합정`, `연남동`, `강남역`"
+            msg = "좋아! 근데 **동네/역**부터 알려줘야 내가 뽑아주지 😎\n예: `합정`, `연남동`, `강남역`"
             st.markdown(msg)
             st.session_state.messages.append({"role": "assistant", "content": msg})
             st.session_state.pending_question = {"scope": "common", "key": "location", "text": msg, "type": "free"}
             st.stop()
 
-        # 5) Kakao 검색
-        query = build_query(conditions)
-        pre_text = generate_pre_recommend_text(conditions, query)
-        st.markdown(pre_text)
+        # -----------------------------
+        # 5) Kakao 검색: relax 0~3 + 근처/주변 변형
+        # -----------------------------
+        def run_kakao(q):
+            return kakao_keyword_search(q, kakao_key, size=15)
 
-        try:
-            places = kakao_keyword_search(query, kakao_key, size=15)
-        except Exception as e:
-            st.error(f"Kakao 검색 중 오류: {e}")
-            st.stop()
+        transport = cm.get("transport")  # 차 / 대중교통 / 상관없음
+        location = conditions.get("location")
+
+        # 중심좌표(역 우선)
+        center = get_location_center(location, kakao_key)
+        cm["center_name"] = center.get("name") if center else None
+
+        places = []
+        used_query = None
+
+        for _ in range(4):  # relax 0~3
+            query = build_query(conditions)
+            variants = make_query_variants(query, location, int(cm.get("search_relax", 0)))
+
+            for q in variants:
+                try:
+                    places = run_kakao(q)
+                except Exception as e:
+                    st.error(f"Kakao 검색 중 오류: {e}")
+                    st.stop()
+
+                if places:
+                    used_query = q
+                    break
+
+            if places:
+                break
+
+            if int(cm.get("search_relax", 0)) < 3:
+                cm["search_relax"] = int(cm.get("search_relax", 0)) + 1
+            else:
+                break
 
         if not places:
-            msg = "헉… 이 조건으로는 딱 맞는 데가 잘 안 잡히네 🥲\n지역을 조금만 넓혀볼까?"
+            msg = "헉… 이 조건으로는 딱 맞는 데가 잘 안 잡히네 🥲\n조건을 조금 느슨하게 해서 근처 위주로 다시 뽑아볼까?"
             st.markdown(msg)
             st.session_state.messages.append({"role": "assistant", "content": msg})
             st.stop()
 
-        # 6) '다른 데 추천해줘' 처리
+        # 추천 시작 멘트
+        pre_text = generate_pre_recommend_text(conditions, used_query or build_query(conditions))
+        st.markdown(pre_text)
+        if debug_mode and used_query:
+            st.caption(f"🔎 사용된 검색어: {used_query} (relax={cm.get('search_relax', 0)})")
+
+        # -----------------------------
+        # 6) 거리/이동수단 기반 정렬 + 도보 반경 정책
+        # -----------------------------
+        if center:
+            places = sort_places_for_transport(places, center, transport)
+        # center가 없으면 원본 순서 유지(안전)
+
+        # diversify / exclude_last는 정렬 이후 적용
         if diversify or exclude_last:
             places = filter_places(places, st.session_state.last_picks_ids)
 
-        if len(places) < 6:
-            places = kakao_keyword_search(query, kakao_key, size=15)
+        # 반경 스텝(대중교통은 더 타이트, 차는 약간 여유)
+        if transport == "차":
+            radius_steps = [1600, 2500, 4000]
+        else:
+            radius_steps = [1200, 1800, 2500]
 
+        # 후보가 충분히 남도록(최소 6개) 반경을 단계적으로 확대
+        picked = []
+        if center:
+            for r in radius_steps:
+                within = filter_places_by_radius(places, center, r)
+                if len(within) >= 6:
+                    picked = within
+                    break
+            if not picked:
+                picked = places
+        else:
+            picked = places
+
+        places = picked[:15]
+
+        # place에 거리/도보분 메타 부착
+        if center:
+            for p in places:
+                d = place_distance_m(p, center)
+                p["_distance_m"] = d if d is not None else 10**12
+                p["_walk_min"] = estimate_walk_minutes(p["_distance_m"])
+        else:
+            for p in places:
+                p["_distance_m"] = 10**12
+                p["_walk_min"] = None
+
+        # -----------------------------
         # 7) rerank
+        # -----------------------------
         picks = rerank_and_format(conditions, places)
 
         if debug_mode:
             with st.expander("🤖 (디버그) rerank LLM 원문"):
                 st.code(st.session_state.debug_raw_rerank)
 
+        # ✅ 최후 보험: rerank 실패 시 거리/정렬 상위 3개로 대체
         if not picks:
-            msg = "후보는 찾았는데… 정리하다가 살짝 꼬였어 😅\n한 번만 더 말해줄래?"
-            st.markdown(msg)
-            st.session_state.messages.append({"role": "assistant", "content": msg})
-            st.stop()
+            fallback = []
+            for p in places[:3]:
+                fallback.append({
+                    "id": p.get("id"),
+                    "scene_feel": "조건을 조금 넓혀서 근처 위주로 골랐어. 부담 없이 고르기 좋은 타입이야.",
+                    "one_line": "근처에서 무난하게 가기 좋은 선택지!",
+                    "hashtags": ["#근처", "#무난", "#바로가기", "#추천"],
+                    "matched_conditions": ["근처 우선", "도보/거리 기준"],
+                    "reason": "후보 정리가 꼬여서, 우선 가까운 곳부터 추렸어. 링크 눌러서 분위기랑 메뉴만 한 번 확인해봐 😎"
+                })
+            picks = fallback
 
+        # -----------------------------
         # 8) 렌더링
+        # -----------------------------
         kakao_map = {p.get("id"): p for p in places}
 
         st.markdown("---")
@@ -822,6 +1052,7 @@ if user_input:
 
         cols = st.columns(3)
         current_pick_ids = []
+        center_name = cm.get("center_name") or "기준점"
 
         for i, pick in enumerate(picks[:3]):
             if not isinstance(pick, dict) or "id" not in pick:
@@ -847,7 +1078,10 @@ if user_input:
                 st.caption(category or "")
                 st.write(f"📍 {addr}")
 
-                # ✅ 고정 노출: 자리 느낌
+                walk_min = place.get("_walk_min")
+                if isinstance(walk_min, int) and walk_min < 180:
+                    st.caption(f"🚶 {center_name} 기준 도보 약 {walk_min}분")
+
                 scene = (pick.get("scene_feel") or "").strip()
                 if scene:
                     st.markdown("🧠 **이런 자리 느낌**")
@@ -871,6 +1105,19 @@ if user_input:
                     st.link_button("카카오맵에서 보기", url)
 
         st.session_state.last_picks_ids = current_pick_ids
+
+        # (선택) 프로토타입 로그 저장(jsonl)
+        try:
+            with open("decision_mate_logs.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": int(time.time()),
+                    "query_used": used_query,
+                    "conditions": conditions,
+                    "picks": picks,
+                    "place_ids": current_pick_ids
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
         final = "끝! 😎\n셋 중에 하나 고르거나, '더 조용한 데', '주차 되는 데', '완전 다른 스타일' 이런 식으로 다시 시켜도 돼."
         st.session_state.messages.append({"role": "assistant", "content": final})
