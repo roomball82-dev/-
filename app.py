@@ -1,13 +1,10 @@
-# decision_mate_app_final_v2.py
+# decision_mate_app_final_v3.py
 # Streamlit prototype for "결정 메이트" (Decision Mate)
-# v2 changes (수상용/안정성 중심):
-# - 공통 필수 질문 6개: 위치/인원(필터)/관계(필터)/술/이동수단/신경쓰는정도
-# - 체류시간 질문 제거
-# - "신경 쓰는 정도(sensitivity_level)" 추가: 관계에 따라 다르게 해석(룰/휴리스틱)
-# - Kakao 후보 풀 확장: page + center/radius + sort=distance
-# - LLM은 "후보 중 3개 선정+설명" 역할에 집중, LLM 전 규칙 필터 강화
-# - 무조건 3개 보장: ensure_3_picks()
-# - 추천이 튀지 않게: (소개팅/연인) 특정 고부담 키워드 약한 금지 필터(과도 X)
+# v3 changes:
+# - 자연어 답변 허용(정확한 선택지 강제 X) 강화: apply_answer() 통짜 교체
+# - 공통 질문에 "대화 vs 음식 중심" (focus_priority) 추가
+# - build_query()에 focus_priority를 약하게 반영(후보 풀 말라죽지 않게)
+# - 기존: 후보 풀 확장(page+radius+center), ensure 3 picks, 필터+LLM 하이브리드 유지
 
 import json
 import re
@@ -48,8 +45,8 @@ if "messages" not in st.session_state:
 
 if "conditions" not in st.session_state:
     st.session_state.conditions = {
-        "location": None,     # "신촌" / "신촌역" 등
-        "food_type": None,    # "일식" / "양식" / "카페" 등 (선택)
+        "location": None,
+        "food_type": None,
         "purpose": None,
         "people": None,
         "mood": None,
@@ -62,14 +59,15 @@ if "conditions" not in st.session_state:
             "context_mode": None,       # 회사 회식 / 친구 / 단체 모임 / 연인·소개팅 / 혼밥 / 가족 / None
             "people_count": None,       # int
             "budget_tier": "상관없음",  # 가성비 / 보통 / 조금 특별 / 상관없음
-            "answers": {},              # mode 확장 질문 답
+            "answers": {},
             "common": {
                 "cannot_eat_done": False,
                 "alcohol_level": None,        # 없음 / 가볍게 / 술 중심
                 "transport": None,            # 차 / 대중교통 / 상관없음
-                "alcohol_plan": None,         # (술 중심) 한 곳 / 나눌 수도 / 모르겠음
+                "sensitivity_level": None,    # 1~4
+                "focus_priority": None,       # 대화 중심 / 음식 중심 / 균형
+                "alcohol_plan": None,         # (술 중심) 한 곳 / 1차·2차 나눌 수도 / 모르겠음
                 "alcohol_type": None,         # (술 중심) 소주/맥주/와인/상관없음
-                "sensitivity_level": None,    # 1~4 (신경 쓰는 정도)
                 "search_relax": 0,            # 0~3
                 "center_name": None,
             },
@@ -110,6 +108,7 @@ def extract_first_json_object(text: str):
 def normalize_conditions(cond: dict):
     if not isinstance(cond, dict):
         return
+
     cond.setdefault("constraints", {})
     c = cond["constraints"]
     c.setdefault("cannot_eat", [])
@@ -127,14 +126,16 @@ def normalize_conditions(cond: dict):
     m.setdefault("budget_tier", "상관없음")
     m.setdefault("answers", {})
     m.setdefault("fast_mode", False)
+
     m.setdefault("common", {})
     cm = m["common"]
     cm.setdefault("cannot_eat_done", False)
     cm.setdefault("alcohol_level", None)
     cm.setdefault("transport", None)
+    cm.setdefault("sensitivity_level", None)
+    cm.setdefault("focus_priority", None)
     cm.setdefault("alcohol_plan", None)
     cm.setdefault("alcohol_type", None)
-    cm.setdefault("sensitivity_level", None)
     cm.setdefault("search_relax", 0)
     cm.setdefault("center_name", None)
 
@@ -173,7 +174,7 @@ def detect_expand_intent(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
-    keywords = ["넓혀", "넓혀봐", "범위", "조금만 넓혀", "근처로", "주변으로"]
+    keywords = ["넓혀", "넓혀봐", "범위", "조금만 넓혀", "근처로", "주변으로", "더 멀어도"]
     return any(k in t for k in keywords)
 
 # -----------------------------
@@ -213,12 +214,12 @@ def kakao_keyword_search(query: str, kakao_rest_key: str, size: int = 15, page: 
     headers = {"Authorization": f"KakaoAK {kakao_rest_key}"}
     params = {"query": query, "size": size, "page": page}
     if x and y:
-        params["x"] = x  # longitude
-        params["y"] = y  # latitude
+        params["x"] = x
+        params["y"] = y
     if radius is not None:
         params["radius"] = radius
     if sort:
-        params["sort"] = sort  # distance/accuracy
+        params["sort"] = sort
     res = requests.get(url, headers=headers, params=params, timeout=10)
     res.raise_for_status()
     return res.json()
@@ -289,7 +290,6 @@ def get_location_center(location: str, kakao_rest_key: str):
     cache = st.session_state.loc_center_cache
     if loc in cache:
         return cache[loc]
-
     candidates = [loc] if "역" in loc else [f"{loc}역", loc]
     for cand in candidates:
         try:
@@ -337,7 +337,7 @@ def sort_places_for_transport(places: list, center: dict, transport: str):
         px, py = p.get("x"), p.get("y")
         dist = haversine_m(cx, cy, px, py) if (px and py) else 10**12
         park = parking_signal_score(p) if transport == "차" else 0
-        score = dist - (park * 120)  # 주차 신호 가점(약하게)
+        score = dist - (park * 120)
         scored.append((score, dist, p))
     scored.sort(key=lambda t: (t[0], t[1]))
     return [p for _, __, p in scored]
@@ -350,7 +350,6 @@ def infer_place_kind(conditions: dict) -> str:
     cm = conditions["meta"]["common"]
     alcohol = cm.get("alcohol_level")
 
-    # user explicitly asked cafe via tokens
     ft = (conditions.get("food_type") or "")
     mood = (conditions.get("mood") or "")
     purpose = (conditions.get("purpose") or "")
@@ -379,14 +378,9 @@ def filter_by_kind(places: list, kind: str):
     return places
 
 # -----------------------------
-# Mild "too heavy" filter (avoid awkward overkill)
+# Mild "too heavy" filter
 # -----------------------------
 def mild_context_filter(places: list, conditions: dict):
-    """
-    MVP 한계 인정하되, 상식적으로 튀는 것만 약하게 방지:
-    - 연인/소개팅 + 신경 3~4: "오마카세/파인다이닝/코스" 같은 부담 키워드 약하게 제거
-    (너무 강하게 하면 후보가 말라서 실패하므로, 최소한만 적용)
-    """
     normalize_conditions(conditions)
     mode = conditions["meta"].get("context_mode")
     s = conditions["meta"]["common"].get("sensitivity_level")
@@ -405,7 +399,7 @@ def mild_context_filter(places: list, conditions: dict):
     return out if len(out) >= 10 else places
 
 # -----------------------------
-# Robust: ensure 3 picks show up
+# Ensure 3 picks
 # -----------------------------
 def ensure_3_picks(picks: list, candidates: list):
     if not isinstance(picks, list):
@@ -441,7 +435,7 @@ def ensure_3_picks(picks: list, candidates: list):
     return fixed[:3]
 
 # -----------------------------
-# 1) Latest utterance -> PATCH (LLM)
+# LLM Patch extraction
 # -----------------------------
 def extract_conditions_patch(latest_user_text: str, current_conditions: dict):
     if client is None:
@@ -486,7 +480,7 @@ def extract_conditions_patch(latest_user_text: str, current_conditions: dict):
     return patch if isinstance(patch, dict) else {}
 
 # -----------------------------
-# 2) Question flow (Common only + optional mode questions remain)
+# Question flow
 # -----------------------------
 MODE_REQUIRED_QUESTIONS = {
     "친구": [
@@ -503,6 +497,9 @@ MODE_REQUIRED_QUESTIONS = {
     ],
 }
 
+SENSI_TEXT = "이 자리는 얼마나 신경 써야 하는 자리야?\n**1) 아무 생각 없이 / 2) 편하지만 너무 막은 아닌 / 3) 좀 신경 써야 하는 / 4) 중요한 자리**"
+FOCUS_TEXT = "오늘은 **대화가 더 중요해? 음식이 더 중요해?** 😌\n**대화 중심 / 음식 중심 / 둘 다 비슷(균형)**"
+
 def get_next_mode_question(conditions: dict):
     normalize_conditions(conditions)
     mode = conditions["meta"]["context_mode"]
@@ -514,8 +511,6 @@ def get_next_mode_question(conditions: dict):
             return {"scope": "mode", **q}
     return None
 
-SENSI_TEXT = "이 자리는 얼마나 신경 써야 하는 자리야?\n**1) 아무 생각 없이 / 2) 편하지만 너무 막은 아닌 / 3) 좀 신경 써야 하는 / 4) 중요한 자리**"
-
 def get_next_common_question(conditions: dict):
     normalize_conditions(conditions)
     cm = conditions["meta"]["common"]
@@ -526,7 +521,6 @@ def get_next_common_question(conditions: dict):
     if not cm.get("cannot_eat_done", False):
         return {"scope": "common", "key": "cannot_eat", "text": "못 먹는 거 있어? (알레르기/극혐 포함) 없으면 **없음** 🙅", "type": "list_or_none"}
 
-    # fast_mode면 여기서 멈춤(추천 진행)
     if conditions["meta"].get("fast_mode"):
         return None
 
@@ -538,6 +532,9 @@ def get_next_common_question(conditions: dict):
 
     if cm.get("sensitivity_level") is None:
         return {"scope": "common", "key": "sensitivity_level", "text": SENSI_TEXT, "type": "enum_sensitivity"}
+
+    if cm.get("focus_priority") is None:
+        return {"scope": "common", "key": "focus_priority", "text": FOCUS_TEXT, "type": "enum_focus"}
 
     if cm.get("alcohol_level") == "술 중심" and cm.get("alcohol_plan") is None:
         return {"scope": "common", "key": "alcohol_plan",
@@ -556,109 +553,176 @@ def get_next_question(conditions: dict):
     return get_next_mode_question(conditions)
 
 # -----------------------------
-# Answer parsing & apply
+# ✅ apply_answer() : 자연어 대응 통짜 교체 + focus_priority 포함
 # -----------------------------
-def parse_list_or_none(text: str):
-    t = (text or "").strip()
-    if not t:
-        return None
-    if "없" in t:
-        return []
-    parts = re.split(r"[,\n/]+", t)
-    out = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        p = re.sub(r"(은|는|이|가|을|를|만|빼고|빼줘)$", "", p).strip()
-        if p and p not in out:
-            out.append(p)
-    return out[:6]
-
 def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     normalize_conditions(conditions)
+
     t = (user_text or "").strip()
+    if not t:
+        return False
+
+    t_low = t.lower()
+
     cm = conditions["meta"]["common"]
     answers = conditions["meta"]["answers"]
-
-    if any(x in t for x in ["술 안", "술안", "안 마셔", "금주", "노알콜", "노 알콜"]):
-        cm["alcohol_level"] = "없음"
-        cm["alcohol_plan"] = None
-        cm["alcohol_type"] = None
-        return True
 
     key = pending_q.get("key")
     qtype = pending_q.get("type")
 
+    # -----------------------------
+    # LOCATION
+    # -----------------------------
     if key == "location":
-        if t:
-            conditions["location"] = t
-            return True
-        return False
+        conditions["location"] = t
+        return True
 
+    # -----------------------------
+    # CANNOT EAT (알레르기/못먹는거)
+    # -----------------------------
     if qtype == "list_or_none" and key == "cannot_eat":
-        parsed = parse_list_or_none(t)
-        if parsed is None:
-            return False
-        conditions["constraints"]["cannot_eat"] = parsed
+        if any(k in t for k in ["없", "상관없", "다 먹", "아무거나"]):
+            conditions["constraints"]["cannot_eat"] = []
+        else:
+            parts = re.split(r"[,\n/]+", t)
+            cleaned = []
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                p = re.sub(r"(은|는|이|가|을|를|만|빼고|빼줘)$", "", p).strip()
+                if p and p not in cleaned:
+                    cleaned.append(p)
+            conditions["constraints"]["cannot_eat"] = cleaned[:6]
         cm["cannot_eat_done"] = True
         return True
 
+    # -----------------------------
+    # ALCOHOL LEVEL
+    # -----------------------------
     if qtype == "enum_alcohol" and key == "alcohol_level":
-        if "없" in t:
-            cm["alcohol_level"] = "없음"; return True
-        if "가볍" in t or "한두" in t:
-            cm["alcohol_level"] = "가볍게"; return True
-        if "술" in t or "중심" in t or "제대로" in t:
-            cm["alcohol_level"] = "술 중심"; return True
+        if any(k in t_low for k in ["안 마", "술 안", "금주", "노알콜", "노 알콜", "못 마", "안먹", "안 먹"]):
+            cm["alcohol_level"] = "없음"
+            cm["alcohol_plan"] = None
+            cm["alcohol_type"] = None
+            return True
+
+        if any(k in t_low for k in ["가볍", "한두잔", "한두 잔", "적당히", "조금", "살짝", "1~2잔", "1-2잔"]):
+            cm["alcohol_level"] = "가볍게"
+            cm["alcohol_plan"] = None
+            cm["alcohol_type"] = None
+            return True
+
+        if any(k in t_low for k in ["술 중심", "제대로", "많이", "달릴", "끝까지", "취할", "폭", "쭉"]):
+            cm["alcohol_level"] = "술 중심"
+            return True
+
         return False
 
+    # -----------------------------
+    # TRANSPORT (차/대중교통/도보/택시 등 자연어)
+    # -----------------------------
     if qtype == "enum_transport" and key == "transport":
-        if "차" in t or "운전" in t:
-            cm["transport"] = "차"; return True
-        if "대중" in t or "지하철" in t or "버스" in t:
-            cm["transport"] = "대중교통"; return True
-        if "상관" in t or "아무" in t:
-            cm["transport"] = "상관없음"; return True
+        # car-ish
+        if any(k in t_low for k in [
+            "차", "자가용", "운전", "몰고", "끌고", "주차", "발렛", "카풀", "렌트", "대리", "타고갈", "타고 갈"
+        ]):
+            cm["transport"] = "차"
+            return True
+
+        # public/walk-ish (사용자 표현을 "대중교통"으로 묶음)
+        if any(k in t_low for k in [
+            "지하철", "버스", "대중", "걸어", "도보", "뚜벅", "뚜벅이", "택시", "전철", "환승", "역", "근처 걸을"
+        ]):
+            cm["transport"] = "대중교통"
+            return True
+
+        # doesn't matter
+        if any(k in t_low for k in ["상관", "아무", "몰라", "그냥", "무관"]):
+            cm["transport"] = "상관없음"
+            return True
+
         return False
 
+    # -----------------------------
+    # SENSITIVITY LEVEL (신경 쓰는 정도)
+    # -----------------------------
     if qtype == "enum_sensitivity" and key == "sensitivity_level":
-        # accept "1"~"4" or keywords
-        if re.search(r"\b1\b", t) or "아무" in t:
+        # numeric
+        if re.search(r"\b1\b", t):
             cm["sensitivity_level"] = 1; return True
-        if re.search(r"\b2\b", t) or ("편" in t and "막" in t):
+        if re.search(r"\b2\b", t):
             cm["sensitivity_level"] = 2; return True
-        if re.search(r"\b3\b", t) or "신경" in t:
+        if re.search(r"\b3\b", t):
             cm["sensitivity_level"] = 3; return True
-        if re.search(r"\b4\b", t) or "중요" in t or "격식" in t:
+        if re.search(r"\b4\b", t):
             cm["sensitivity_level"] = 4; return True
-        # soft parse: "편하지만" -> 2, "분위기" -> 3
-        if "편하" in t:
+
+        # keywords
+        if any(k in t for k in ["아무 생각", "막", "편하게", "완전 편", "캐주얼", "대충", "가볍게 가자"]):
+            cm["sensitivity_level"] = 1; return True
+
+        if any(k in t for k in ["적당히", "무난", "너무 막은 아닌", "깔끔하면", "평범하게"]):
             cm["sensitivity_level"] = 2; return True
-        if "분위기" in t:
+
+        if any(k in t for k in ["좀 신경", "분위기", "괜찮은 데", "데이트 느낌", "나쁘지 않게", "괜찮게"]):
             cm["sensitivity_level"] = 3; return True
+
+        if any(k in t for k in ["중요", "격식", "기념일", "특별한 날", "상견례", "부모님", "접대"]):
+            cm["sensitivity_level"] = 4; return True
+
         return False
 
+    # -----------------------------
+    # FOCUS PRIORITY (대화/음식/균형) ✅ 추가
+    # -----------------------------
+    if qtype == "enum_focus" and key == "focus_priority":
+        # 대화
+        if any(k in t for k in ["대화", "수다", "얘기", "말", "토크", "이야기", "조용", "편하게 얘기"]):
+            cm["focus_priority"] = "대화 중심"
+            return True
+
+        # 음식
+        if any(k in t for k in ["음식", "먹는", "맛", "메뉴", "맛있는", "맛집", "배고파", "든든"]):
+            cm["focus_priority"] = "음식 중심"
+            return True
+
+        # 균형
+        if any(k in t for k in ["둘", "비슷", "반반", "균형", "상관", "아무"]):
+            cm["focus_priority"] = "균형"
+            return True
+
+        return False
+
+    # -----------------------------
+    # ALCOHOL PLAN
+    # -----------------------------
     if qtype == "enum_alcohol_plan" and key == "alcohol_plan":
-        if "한" in t and "곳" in t:
+        if any(k in t for k in ["한 곳", "한군데", "한 군데", "올인원", "한방에", "한 번에"]):
             cm["alcohol_plan"] = "한 곳"; return True
-        if "나눌" in t or ("1" in t and "2" in t):
+        if any(k in t for k in ["나눠", "2차", "1차", "옮겨", "이동", "코스", "바꿔"]):
             cm["alcohol_plan"] = "1차·2차 나눌 수도"; return True
-        if "모르" in t or "아직" in t:
+        if any(k in t for k in ["모르", "아직", "그때 가서", "상황봐서"]):
             cm["alcohol_plan"] = "모르겠음"; return True
         return False
 
+    # -----------------------------
+    # ALCOHOL TYPE
+    # -----------------------------
     if qtype == "enum_alcohol_type" and key == "alcohol_type":
-        if "소주" in t:
+        if "소주" in t or "참이슬" in t or "처음처럼" in t:
             cm["alcohol_type"] = "소주"; return True
-        if "맥주" in t or "비어" in t:
+        if any(k in t for k in ["맥주", "비어", "크래프트", "IPA", "라거", "에일"]):
             cm["alcohol_type"] = "맥주"; return True
-        if "와인" in t:
+        if "와인" in t or "내추럴" in t:
             cm["alcohol_type"] = "와인"; return True
-        if "상관" in t or "아무" in t:
+        if any(k in t for k in ["상관", "아무", "무관"]):
             cm["alcohol_type"] = "상관없음"; return True
         return False
 
+    # -----------------------------
+    # MODE questions (optional)
+    # -----------------------------
     if pending_q.get("scope") == "mode":
         k = key
         maps = {
@@ -680,7 +744,7 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     return False
 
 # -----------------------------
-# Query build (relax 0~3)
+# Query build (relax 0~3) + focus_priority 반영(약하게)
 # -----------------------------
 def build_query(conditions):
     normalize_conditions(conditions)
@@ -690,6 +754,7 @@ def build_query(conditions):
     alcohol = cm.get("alcohol_level")
     alcohol_type = cm.get("alcohol_type")
     s = cm.get("sensitivity_level")
+    focus = cm.get("focus_priority")
     relax = int(cm.get("search_relax", 0) or 0)
 
     tokens = []
@@ -701,7 +766,6 @@ def build_query(conditions):
     if conditions.get("food_type"):
         tokens.append(conditions["food_type"])
 
-    # core token by alcohol / explicit cafe
     kind = infer_place_kind(conditions)
     if kind == "cafe":
         place_token = "카페"
@@ -715,19 +779,31 @@ def build_query(conditions):
     else:
         place_token = "맛집"
 
-    # sensitivity: keep gentle (avoid over-constraining)
-    # only apply at relax==0
+    # relax==0에서만 약한 컨텍스트 토큰 추가 (후보 풀 말라죽는 거 방지)
     if relax == 0:
         tokens.append(place_token)
+
         if mode == "연인 · 썸 · 소개팅" and kind != "drink":
             tokens.append("데이트")
+
         if mode == "회사 회식":
             tokens.append("회식")
+
         if budget == "가성비":
             tokens.append("가성비")
-        # weak vibe token
+
+        # 신경 레벨이 높으면 '분위기' 정도만
         if isinstance(s, int) and s >= 3 and kind == "meal":
             tokens.append("분위기")
+
+        # ✅ focus_priority: 대화 중심이면 조용/대화 토큰 약하게(검색어에만)
+        if focus == "대화 중심":
+            # 너무 강하면 후보가 줄어서 '조용' 하나만
+            tokens.append("조용")
+        elif focus == "음식 중심":
+            # 맛집 토큰은 이미 있어서 추가 X (과도제약 방지)
+            pass
+
     elif relax == 1:
         tokens.append(place_token)
     elif relax == 2:
@@ -933,13 +1009,13 @@ if user_input:
         if detect_expand_intent(user_input):
             cm["search_relax"] = min(3, int(cm.get("search_relax", 0)) + 1)
 
-        # 1) Apply pending question answer first
+        # 1) Apply pending answer first
         if st.session_state.pending_question is not None:
             ok = apply_answer(conditions, st.session_state.pending_question, user_input)
             if ok:
                 st.session_state.pending_question = None
 
-        # 2) Extract patch and merge
+        # 2) Patch merge
         patch = extract_conditions_patch(user_input, conditions)
         diversify = bool(patch.pop("diversify", False))
         exclude_last = bool(patch.pop("exclude_last", False))
@@ -948,24 +1024,22 @@ if user_input:
         st.session_state.conditions = conditions
         cm = conditions["meta"]["common"]
 
-        # Debug: current conditions
+        # Debug
         with st.expander("🧾 현재 누적 조건(JSON)"):
             st.json(conditions)
             if debug_mode:
                 st.markdown("**(디버그) patch 원문**")
                 st.code(st.session_state.debug_raw_patch)
 
-        # 3) Ask next question if needed
+        # 3) Next question
         next_q = get_next_question(conditions)
 
-        # fast_mode: still ask location/cannot_eat only
         if next_q and not (conditions["meta"].get("fast_mode") and next_q.get("key") not in ("location", "cannot_eat")):
             st.markdown(next_q["text"])
             st.session_state.messages.append({"role": "assistant", "content": next_q["text"]})
             st.session_state.pending_question = next_q
             st.stop()
 
-        # 4) If location missing, force ask
         if not conditions.get("location"):
             msg = "좋아! 근데 **동네/역**부터 알려줘야 내가 뽑아주지 😎\n예: `합정`, `연남동`, `강남역`"
             st.markdown(msg)
@@ -974,7 +1048,7 @@ if user_input:
             st.stop()
 
         # -----------------------------
-        # 5) Kakao search: bigger pool + center/radius/distance
+        # Kakao search: bigger pool + center/radius/distance
         # -----------------------------
         transport = cm.get("transport") or "상관없음"
         location = conditions.get("location")
@@ -1038,7 +1112,7 @@ if user_input:
                 st.caption(f"📌 중심좌표: {cm.get('center_name')}")
 
         # -----------------------------
-        # 6) Sort + exclude last + focus radius + attach meta
+        # Sort + exclude last + radius focus + attach meta
         # -----------------------------
         if center:
             places = sort_places_for_transport(places, center, transport)
@@ -1046,7 +1120,6 @@ if user_input:
         if diversify or exclude_last:
             places = filter_places(places, st.session_state.last_picks_ids)
 
-        # focus radius: keep enough pool
         focused = []
         if center:
             for r in ([1200, 1800, 2500] if transport != "차" else [1600, 2500, 4000]):
@@ -1062,14 +1135,14 @@ if user_input:
         focused = attach_distance_meta(focused, center)
 
         # -----------------------------
-        # 7) Rule-based filtering BEFORE LLM
+        # Filters BEFORE LLM
         # -----------------------------
         kind = infer_place_kind(conditions)
         filtered = filter_by_kind(focused, kind)
         filtered = mild_context_filter(filtered, conditions)
         filtered = filter_franchise(filtered, avoid_franchise)
 
-        candidates = filtered[:25]  # LLM pool
+        candidates = filtered[:25]
 
         if debug_mode:
             with st.expander("🧪 (디버그) 후보 풀"):
@@ -1083,24 +1156,24 @@ if user_input:
                     "kind": kind,
                     "raw_places": len(places),
                     "focused": len(focused),
-                    "after_kind": len(filtered),
+                    "after_filters": len(filtered),
                     "candidates": len(candidates),
                     "sample": sample
                 })
 
         # -----------------------------
-        # 8) Rerank
+        # Rerank
         # -----------------------------
         picks = rerank_and_format(conditions, candidates)
+
         if debug_mode:
             with st.expander("🤖 (디버그) rerank LLM 원문"):
                 st.code(st.session_state.debug_raw_rerank)
 
-        # guarantee 3 renderable picks
         picks = ensure_3_picks(picks, candidates)
 
         # -----------------------------
-        # 9) Render
+        # Render
         # -----------------------------
         kakao_map = {p.get("id"): p for p in candidates if p.get("id")}
 
@@ -1161,7 +1234,7 @@ if user_input:
 
         st.session_state.last_picks_ids = current_pick_ids
 
-        # log (optional)
+        # optional log
         try:
             with open("decision_mate_logs.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps({
@@ -1183,6 +1256,6 @@ if user_input:
         except Exception:
             pass
 
-        final = "끝! 😎\n셋 중에 하나 고르거나, '더 조용한 쪽', '좀 더 캐주얼', '프차 빼줘', '방금 추천 제외하고 다시' 이런 식으로 다시 시켜도 돼."
+        final = "끝! 😎\n셋 중에 하나 고르거나, '대화 더 되는 쪽', '음식 더 확실한 쪽', '프차 빼줘', '방금 추천 제외하고 다시' 이런 식으로 다시 시켜도 돼."
         st.session_state.messages.append({"role": "assistant", "content": final})
         st.markdown(final)
