@@ -1,11 +1,14 @@
-# decision_mate_app_final_v3_21.py
+# decision_mate_app_final_v3_3.py
 # Streamlit prototype for "결정 메이트" (Decision Mate)
-# v3.21:
-# - 사이드바 필터 변경 시: 대화 유지 + 질문만 새로(answers/pending/common 일부 reset)
+# v3.3:
+# - 사이드바 필터 변경 시: 대화 유지 + 질문만 조용히 리셋(말 안 함)
 # - 새 추천 버튼: 전체 리셋(키 유지)
-# - 술 질문 "없음" 인식 버그 fix
-# - 후보 풀 확장 + 필터 단계적 해제 + 3개 보장(ensure_3_picks) + 렌더 3개 채우기
-# - 자연어 대응 강화(뚜벅이/걸어갈거야/없음 등)
+# - 술 질문 "없음" 인식 버그 fix 유지
+# - 후보 풀 확장 + 필터 단계적 해제 + 3개 보장 + 렌더 3개 채우기
+# - ✅ 주종(소주/맥주/와인) 강제 반영:
+#   * build_query: 소주=포차/한식주점, 맥주=펍/호프, 와인=와인바
+#   * 후보: 주종 매칭 스코어로 정렬 + 약한 필터링
+#   * rerank 프롬프트에 주종 우선 하드룰
 
 import json
 import re
@@ -49,7 +52,6 @@ kakao_key = st.sidebar.text_input(
     key="kakao_key_input",
 )
 
-# persist keys across reruns
 st.session_state.openai_key = openai_key
 st.session_state.kakao_key = kakao_key
 
@@ -77,7 +79,7 @@ def init_conditions():
             "context_mode": None,
             "people_count": None,
             "budget_tier": "상관없음",
-            "answers": {},  # mode-specific answers
+            "answers": {},
             "common": {
                 "cannot_eat_done": False,
                 "alcohol_level": None,        # 없음 / 가볍게 / 술 중심
@@ -85,7 +87,7 @@ def init_conditions():
                 "sensitivity_level": None,    # 1~4
                 "focus_priority": None,       # 대화 중심 / 음식 중심 / 균형
                 "alcohol_plan": None,         # (술 중심)
-                "alcohol_type": None,         # (술 중심)
+                "alcohol_type": None,         # (술 중심) 소주/맥주/와인/상관없음
                 "search_relax": 0,            # 0~3
                 "center_name": None,
             },
@@ -209,7 +211,6 @@ def merge_conditions(base: dict, patch: dict):
     return base
 
 def sync_sidebar_to_conditions(conditions, selected_mode, people_count, budget_tier):
-    """사이드바 필터 값을 conditions에 강제로 싱크(한 군데에서만 수행)"""
     normalize_conditions(conditions)
     meta = conditions["meta"]
     meta["context_mode"] = None if selected_mode == "선택 안 함" else selected_mode
@@ -252,7 +253,7 @@ selected_mode = st.sidebar.selectbox("상황 모드", MODE_OPTIONS, index=0)
 people_count = st.sidebar.number_input("인원", min_value=1, max_value=30, value=2, step=1)
 budget_tier = st.sidebar.radio("예산대(1인)", BUDGET_OPTIONS, index=0)
 
-# ✅ v3.21: 필터 변경 감지 -> 대화는 유지, 질문만 새로 (answers/pending/common 일부 reset)
+# ✅ v3.3: 필터 변경 감지 -> 대화 유지 + 질문만 조용히 리셋(말 안 함)
 profile = f"{selected_mode}|{int(people_count)}|{budget_tier}"
 prev_profile = st.session_state.get("sidebar_profile")
 if prev_profile is None:
@@ -260,26 +261,20 @@ if prev_profile is None:
 else:
     if profile != prev_profile:
         st.session_state.sidebar_profile = profile
+        normalize_conditions(st.session_state.conditions)
 
-        # 1) 진행 중 질문 제거(이전 질문이 남아있으면 꼬임 방지)
+        # 진행 중 질문 제거
         st.session_state.pending_question = None
 
-        # 2) 모드별 질문 답변 초기화 (대화는 유지)
-        normalize_conditions(st.session_state.conditions)
+        # 모드 답변 초기화
         st.session_state.conditions["meta"]["answers"] = {}
 
-        # 3) fast_mode는 끄는 게 자연스러움
+        # fast_mode 끄기
         st.session_state.conditions["meta"]["fast_mode"] = False
 
-        # 4) (선택) 모드/예산/인원 바뀌면 민감도/포커스는 새로 묻게
+        # 공통 질문 중 "자리 성격"에 가까운 값은 새로 묻게(모드 바뀌면 의미 달라짐)
         st.session_state.conditions["meta"]["common"]["sensitivity_level"] = None
         st.session_state.conditions["meta"]["common"]["focus_priority"] = None
-
-        # UX: 필터 반영 알림(짧게)
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": "오케이, 상황 바뀐 거 반영해서 질문만 다시 갈게 😎"
-        })
 
 # -----------------------------
 # Kakao Local API
@@ -446,7 +441,7 @@ def filter_by_kind(places: list, kind: str):
         out = [p for p in places if any(a in cat(p) for a in allow)]
         return out if len(out) >= 10 else places
     if kind == "drink":
-        allow = ["술", "주점", "호프", "이자카야", "바", "포차", "펍"]
+        allow = ["술", "주점", "호프", "이자카야", "바", "포차", "펍", "와인"]
         out = [p for p in places if any(a in cat(p) for a in allow)]
         return out if len(out) >= 10 else places
     return places
@@ -464,6 +459,60 @@ def mild_context_filter(places: list, conditions: dict):
     for p in places:
         name = (p.get("place_name") or "")
         if any(b in name for b in banned):
+            continue
+        out.append(p)
+    return out if len(out) >= 10 else places
+
+# -----------------------------
+# ✅ Alcohol type scoring / prioritization
+# -----------------------------
+def alcohol_match_score(place: dict, alcohol_type: str | None) -> int:
+    if not alcohol_type or alcohol_type == "상관없음":
+        return 0
+    name = (place.get("place_name") or "").lower()
+    cat = (place.get("category_name") or "").lower()
+    text = f"{name} {cat}"
+
+    if alcohol_type == "소주":
+        hits = ["포차", "실내포차", "주점", "한식주점", "소주", "막걸리", "한잔", "전", "곱창", "닭발", "삼겹", "고기"]
+        misses = ["펍", "브루", "브루어리", "크래프트", "와인", "와인바", "칵테일", "바", "beer", "pub"]
+    elif alcohol_type == "맥주":
+        hits = ["호프", "펍", "비어", "브루", "브루어리", "크래프트", "beer", "pub", "치킨"]
+        misses = ["와인", "와인바", "전통주", "막걸리", "소주방", "포차", "한식주점"]
+    elif alcohol_type == "와인":
+        hits = ["와인", "와인바", "비스트로", "내추럴", "wine", "bar", "브런치"]
+        misses = ["호프", "펍", "포차", "소주", "막걸리", "치킨호프"]
+    else:
+        return 0
+
+    score = 0
+    for h in hits:
+        if h in text:
+            score += 2
+    for m in misses:
+        if m in text:
+            score -= 2
+    return score
+
+def prioritize_by_alcohol_type(places: list, alcohol_type: str | None) -> list:
+    if not alcohol_type or alcohol_type == "상관없음":
+        return places
+    scored = [(alcohol_match_score(p, alcohol_type), p) for p in places]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored]
+
+def light_filter_by_alcohol_type(places: list, alcohol_type: str | None) -> list:
+    """
+    강한 필터는 풀을 망치니까 '명백히 반대'만 조금 걷어내는 정도.
+    """
+    if not alcohol_type or alcohol_type == "상관없음":
+        return places
+
+    out = []
+    for p in places:
+        s = alcohol_match_score(p, alcohol_type)
+        # -4 이하로 강하게 반대면 제거
+        if s <= -4:
             continue
         out.append(p)
     return out if len(out) >= 10 else places
@@ -660,7 +709,6 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
         cm["cannot_eat_done"] = True
         return True
 
-    # ✅ 술 없음 버그 fix: "없음/없어/ㄴㄴ/x/no" 등 단답 포함
     if qtype == "enum_alcohol" and key == "alcohol_level":
         if t_low in ["없음", "없어", "노", "no", "x", "ㄴㄴ", "안함", "안 해", "안해", "패스"]:
             cm["alcohol_level"] = "없음"
@@ -779,7 +827,7 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     return False
 
 # -----------------------------
-# Query build (relax 0~3)
+# Query build (relax 0~3) + ✅ alcohol type query 강화
 # -----------------------------
 def build_query(conditions):
     normalize_conditions(conditions)
@@ -800,20 +848,34 @@ def build_query(conditions):
         tokens.append(conditions["food_type"])
 
     kind = infer_place_kind(conditions)
+
     if kind == "cafe":
         place_token = "카페"
+
     elif kind == "drink":
+        # ✅ 주종 기반 토큰
         if alcohol_type == "와인":
             place_token = "와인바"
         elif alcohol_type == "맥주":
             place_token = "펍"
+        elif alcohol_type == "소주":
+            place_token = "포차"
         else:
             place_token = "술집"
+
     else:
         place_token = "맛집"
 
     if relax == 0:
         tokens.append(place_token)
+
+        # ✅ 소주면 검색 토큰을 조금 더 강하게
+        if kind == "drink" and alcohol_type == "소주":
+            tokens.append("한식주점")
+
+        if kind == "drink" and alcohol_type == "맥주":
+            tokens.append("호프")
+
         if mode == "연인 · 썸 · 소개팅" and kind != "drink":
             tokens.append("데이트")
         if mode == "회사 회식":
@@ -883,6 +945,7 @@ def rerank_and_format(conditions, places):
     normalize_conditions(conditions)
     cm = conditions["meta"]["common"]
     split_12 = (cm.get("alcohol_level") == "술 중심" and cm.get("alcohol_plan") == "1차·2차 나눌 수도")
+    alcohol_type = cm.get("alcohol_type")
 
     compact = []
     for p in places[:25]:
@@ -894,6 +957,7 @@ def rerank_and_format(conditions, places):
             "url": p.get("place_url"),
             "walk_min": p.get("_walk_min"),
             "distance_m": p.get("_distance_m"),
+            "alcohol_score": alcohol_match_score(p, alcohol_type),
         })
 
     schema_hint = """
@@ -923,6 +987,14 @@ def rerank_and_format(conditions, places):
   - 2차 1개
 """
 
+    alcohol_rule = ""
+    if alcohol_type and alcohol_type != "상관없음":
+        alcohol_rule = f"""
+- 사용자가 주종을 '{alcohol_type}'로 골랐으면, 그 주종과 가까운 후보를 우선으로 뽑아라.
+- 주종과 명백히 다른 후보(예: 소주인데 펍/브루어리/와인바)는 가능하면 제외하라.
+- 후보 데이터에 주종 필드가 없으므로 category/name 신호로만 판단하고, 단정/확신 표현 금지.
+"""
+
     prompt = f"""
 너는 '결정 메이트'다.
 사용자 조건에 맞춰 아래 후보 중 BEST 3곳만 골라라.
@@ -937,6 +1009,7 @@ def rerank_and_format(conditions, places):
 - 후보 데이터 기반으로만 말하기 (없는 정보 상상 금지)
 - picks는 반드시 3개
 - scene_feel은 "실내 좌석 간격/조명/사진 분석"처럼 단정 금지. '체감'만.
+{alcohol_rule}
 {extra_rules}
 
 [사용자 조건]
@@ -1019,7 +1092,7 @@ if user_input:
         normalize_conditions(st.session_state.conditions)
         conditions = st.session_state.conditions
 
-        # ✅ v3.21: 매 턴 시작 시 사이드바 필터 -> conditions 강제 싱크
+        # ✅ 매 턴 시작 시 사이드바 필터 -> conditions 강제 싱크
         conditions = sync_sidebar_to_conditions(conditions, selected_mode, people_count, budget_tier)
         st.session_state.conditions = conditions
         cm = conditions["meta"]["common"]
@@ -1043,7 +1116,7 @@ if user_input:
         avoid_franchise = bool(patch.pop("avoid_franchise", False))
 
         conditions = merge_conditions(conditions, patch)
-        # (중요) patch로 meta가 들어오더라도, 마지막에 사이드바 싱크로 덮어야 "필터 우선"이 됨
+        # 필터 우선
         conditions = sync_sidebar_to_conditions(conditions, selected_mode, people_count, budget_tier)
 
         st.session_state.conditions = conditions
@@ -1079,6 +1152,7 @@ if user_input:
         # -----------------------------
         transport = cm.get("transport") or "상관없음"
         location = conditions.get("location")
+        alcohol_type = cm.get("alcohol_type")
 
         center = get_location_center(location, kakao_key)
         cm["center_name"] = center.get("name") if center else None
@@ -1131,9 +1205,12 @@ if user_input:
             fallback_queries = [
                 f"{location} 맛집",
                 f"{location} 음식점",
+                f"{location} 포차" if (kind_now == "drink" and alcohol_type == "소주") else "",
+                f"{location} 펍" if (kind_now == "drink" and alcohol_type == "맥주") else "",
+                f"{location} 와인바" if (kind_now == "drink" and alcohol_type == "와인") else "",
                 f"{location} 술집" if kind_now == "drink" else (f"{location} 카페" if kind_now == "cafe" else f"{location} 맛집"),
             ]
-            for fq in fallback_queries:
+            for fq in [x for x in fallback_queries if x]:
                 try:
                     if center:
                         more = kakao_keyword_search_paged(
@@ -1171,6 +1248,8 @@ if user_input:
             st.caption(f"🔎 사용된 검색어: {used_query} (relax={cm.get('search_relax', 0)})")
             if center:
                 st.caption(f"📌 중심좌표: {cm.get('center_name')}")
+            if alcohol_type:
+                st.caption(f"🍶 주종: {alcohol_type}")
 
         # -----------------------------
         # Sort + exclude last + radius focus + attach meta
@@ -1202,6 +1281,11 @@ if user_input:
         filtered = mild_context_filter(filtered, conditions)
         filtered = filter_franchise(filtered, avoid_franchise)
 
+        # ✅ 주종 반영: (1) 약한 필터 (2) 주종 매칭 점수로 정렬
+        if kind_now == "drink":
+            filtered = light_filter_by_alcohol_type(filtered, alcohol_type)
+            filtered = prioritize_by_alcohol_type(filtered, alcohol_type)
+
         # candidates 최소 확보(필터 단계적 해제)
         candidates = filtered[:25]
         if len(candidates) < 12:
@@ -1211,13 +1295,18 @@ if user_input:
         if len(candidates) < 3:
             candidates = (places + focused)[:30]
 
+        # candidates에도 주종 정렬 다시 한번(확실히)
+        if kind_now == "drink":
+            candidates = prioritize_by_alcohol_type(candidates, alcohol_type)
+
         if debug_mode:
             with st.expander("🧪 (디버그) 후보 풀"):
                 sample = [{
                     "name": p.get("place_name"),
                     "cat": p.get("category_name"),
                     "walk_min": p.get("_walk_min"),
-                    "dist_m": p.get("_distance_m")
+                    "dist_m": p.get("_distance_m"),
+                    "alc_score": alcohol_match_score(p, alcohol_type),
                 } for p in candidates[:15]]
                 st.json({
                     "kind": kind_now,
@@ -1304,6 +1393,9 @@ if user_input:
                 if isinstance(walk_min, int) and walk_min < 180:
                     st.caption(f"🚶 {center_name} 기준 도보 약 {walk_min}분")
 
+                if kind_now == "drink" and alcohol_type and alcohol_type != "상관없음":
+                    st.caption(f"🍶 주종 매칭 점수: {alcohol_match_score(place, alcohol_type)} (이름/카테고리 기반 추정)")
+
                 scene = (pick.get("scene_feel") or "").strip()
                 if scene:
                     st.markdown("🧠 **이런 자리 느낌**")
@@ -1350,6 +1442,6 @@ if user_input:
         except Exception:
             pass
 
-        final_msg = "끝! 😎\n셋 중에 하나 고르거나, '대화 더 되는 쪽', '음식 더 확실한 쪽', '프차 빼줘', '방금 추천 제외하고 다시' 이런 식으로 다시 시켜도 돼."
+        final_msg = "끝! 😎\n셋 중에 하나 고르거나, '프차 빼줘', '방금 추천 제외하고 다시', '더 가까운 쪽', '완전 다른 스타일' 이런 식으로 다시 시켜도 돼."
         st.session_state.messages.append({"role": "assistant", "content": final_msg})
         st.markdown(final_msg)
