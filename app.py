@@ -1,10 +1,9 @@
-# decision_mate_app_final_v3.py
+# decision_mate_app_final_v3_1.py
 # Streamlit prototype for "결정 메이트" (Decision Mate)
-# v3 changes:
-# - 자연어 답변 허용(정확한 선택지 강제 X) 강화: apply_answer() 통짜 교체
-# - 공통 질문에 "대화 vs 음식 중심" (focus_priority) 추가
-# - build_query()에 focus_priority를 약하게 반영(후보 풀 말라죽지 않게)
-# - 기존: 후보 풀 확장(page+radius+center), ensure 3 picks, 필터+LLM 하이브리드 유지
+# v3.1 hotfix:
+# - "1개만 뜸" 방지: 후보 풀이 3개 미만이면 강제 확장 검색 + 필터 단계적 해제 + ensure_3_picks
+# - focus_priority(대화/음식/균형) 공통 질문 포함
+# - apply_answer() 자연어 인식 강화(선택지 정확 문장 강제 X)
 
 import json
 import re
@@ -56,9 +55,9 @@ if "conditions" not in st.session_state:
             "need_parking": None
         },
         "meta": {
-            "context_mode": None,       # 회사 회식 / 친구 / 단체 모임 / 연인·소개팅 / 혼밥 / 가족 / None
-            "people_count": None,       # int
-            "budget_tier": "상관없음",  # 가성비 / 보통 / 조금 특별 / 상관없음
+            "context_mode": None,
+            "people_count": None,
+            "budget_tier": "상관없음",
             "answers": {},
             "common": {
                 "cannot_eat_done": False,
@@ -66,8 +65,8 @@ if "conditions" not in st.session_state:
                 "transport": None,            # 차 / 대중교통 / 상관없음
                 "sensitivity_level": None,    # 1~4
                 "focus_priority": None,       # 대화 중심 / 음식 중심 / 균형
-                "alcohol_plan": None,         # (술 중심) 한 곳 / 1차·2차 나눌 수도 / 모르겠음
-                "alcohol_type": None,         # (술 중심) 소주/맥주/와인/상관없음
+                "alcohol_plan": None,         # (술 중심)
+                "alcohol_type": None,         # (술 중심)
                 "search_relax": 0,            # 0~3
                 "center_name": None,
             },
@@ -337,7 +336,7 @@ def sort_places_for_transport(places: list, center: dict, transport: str):
         px, py = p.get("x"), p.get("y")
         dist = haversine_m(cx, cy, px, py) if (px and py) else 10**12
         park = parking_signal_score(p) if transport == "차" else 0
-        score = dist - (park * 120)
+        score = dist - (park * 120)  # 약한 가중치
         scored.append((score, dist, p))
     scored.sort(key=lambda t: (t[0], t[1]))
     return [p for _, __, p in scored]
@@ -356,7 +355,6 @@ def infer_place_kind(conditions: dict) -> str:
     text = f"{ft} {mood} {purpose}"
     if any(k in text for k in ["카페", "커피", "디저트", "베이커리"]):
         return "cafe"
-
     if alcohol in ("가볍게", "술 중심"):
         return "drink"
     return "meal"
@@ -399,7 +397,7 @@ def mild_context_filter(places: list, conditions: dict):
     return out if len(out) >= 10 else places
 
 # -----------------------------
-# Ensure 3 picks
+# Ensure 3 picks (FINAL safety net)
 # -----------------------------
 def ensure_3_picks(picks: list, candidates: list):
     if not isinstance(picks, list):
@@ -435,7 +433,7 @@ def ensure_3_picks(picks: list, candidates: list):
     return fixed[:3]
 
 # -----------------------------
-# LLM Patch extraction
+# Patch extraction (LLM)
 # -----------------------------
 def extract_conditions_patch(latest_user_text: str, current_conditions: dict):
     if client is None:
@@ -553,7 +551,7 @@ def get_next_question(conditions: dict):
     return get_next_mode_question(conditions)
 
 # -----------------------------
-# ✅ apply_answer() : 자연어 대응 통짜 교체 + focus_priority 포함
+# ✅ apply_answer (자연어 대응 강화)
 # -----------------------------
 def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     normalize_conditions(conditions)
@@ -563,23 +561,16 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
         return False
 
     t_low = t.lower()
-
     cm = conditions["meta"]["common"]
     answers = conditions["meta"]["answers"]
 
     key = pending_q.get("key")
     qtype = pending_q.get("type")
 
-    # -----------------------------
-    # LOCATION
-    # -----------------------------
     if key == "location":
         conditions["location"] = t
         return True
 
-    # -----------------------------
-    # CANNOT EAT (알레르기/못먹는거)
-    # -----------------------------
     if qtype == "list_or_none" and key == "cannot_eat":
         if any(k in t for k in ["없", "상관없", "다 먹", "아무거나"]):
             conditions["constraints"]["cannot_eat"] = []
@@ -597,58 +588,35 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
         cm["cannot_eat_done"] = True
         return True
 
-    # -----------------------------
-    # ALCOHOL LEVEL
-    # -----------------------------
     if qtype == "enum_alcohol" and key == "alcohol_level":
         if any(k in t_low for k in ["안 마", "술 안", "금주", "노알콜", "노 알콜", "못 마", "안먹", "안 먹"]):
             cm["alcohol_level"] = "없음"
             cm["alcohol_plan"] = None
             cm["alcohol_type"] = None
             return True
-
         if any(k in t_low for k in ["가볍", "한두잔", "한두 잔", "적당히", "조금", "살짝", "1~2잔", "1-2잔"]):
             cm["alcohol_level"] = "가볍게"
             cm["alcohol_plan"] = None
             cm["alcohol_type"] = None
             return True
-
         if any(k in t_low for k in ["술 중심", "제대로", "많이", "달릴", "끝까지", "취할", "폭", "쭉"]):
             cm["alcohol_level"] = "술 중심"
             return True
-
         return False
 
-    # -----------------------------
-    # TRANSPORT (차/대중교통/도보/택시 등 자연어)
-    # -----------------------------
     if qtype == "enum_transport" and key == "transport":
-        # car-ish
-        if any(k in t_low for k in [
-            "차", "자가용", "운전", "몰고", "끌고", "주차", "발렛", "카풀", "렌트", "대리", "타고갈", "타고 갈"
-        ]):
+        if any(k in t_low for k in ["차", "자가용", "운전", "몰고", "끌고", "주차", "발렛", "카풀", "렌트", "대리", "타고갈", "타고 갈"]):
             cm["transport"] = "차"
             return True
-
-        # public/walk-ish (사용자 표현을 "대중교통"으로 묶음)
-        if any(k in t_low for k in [
-            "지하철", "버스", "대중", "걸어", "도보", "뚜벅", "뚜벅이", "택시", "전철", "환승", "역", "근처 걸을"
-        ]):
+        if any(k in t_low for k in ["지하철", "버스", "대중", "걸어", "도보", "뚜벅", "뚜벅이", "택시", "전철", "환승", "역"]):
             cm["transport"] = "대중교통"
             return True
-
-        # doesn't matter
         if any(k in t_low for k in ["상관", "아무", "몰라", "그냥", "무관"]):
             cm["transport"] = "상관없음"
             return True
-
         return False
 
-    # -----------------------------
-    # SENSITIVITY LEVEL (신경 쓰는 정도)
-    # -----------------------------
     if qtype == "enum_sensitivity" and key == "sensitivity_level":
-        # numeric
         if re.search(r"\b1\b", t):
             cm["sensitivity_level"] = 1; return True
         if re.search(r"\b2\b", t):
@@ -658,45 +626,28 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
         if re.search(r"\b4\b", t):
             cm["sensitivity_level"] = 4; return True
 
-        # keywords
-        if any(k in t for k in ["아무 생각", "막", "편하게", "완전 편", "캐주얼", "대충", "가볍게 가자"]):
+        if any(k in t for k in ["아무 생각", "막", "편하게", "완전 편", "캐주얼", "대충"]):
             cm["sensitivity_level"] = 1; return True
-
         if any(k in t for k in ["적당히", "무난", "너무 막은 아닌", "깔끔하면", "평범하게"]):
             cm["sensitivity_level"] = 2; return True
-
-        if any(k in t for k in ["좀 신경", "분위기", "괜찮은 데", "데이트 느낌", "나쁘지 않게", "괜찮게"]):
+        if any(k in t for k in ["좀 신경", "분위기", "괜찮은 데", "데이트 느낌", "나쁘지 않게"]):
             cm["sensitivity_level"] = 3; return True
-
         if any(k in t for k in ["중요", "격식", "기념일", "특별한 날", "상견례", "부모님", "접대"]):
             cm["sensitivity_level"] = 4; return True
-
         return False
 
-    # -----------------------------
-    # FOCUS PRIORITY (대화/음식/균형) ✅ 추가
-    # -----------------------------
     if qtype == "enum_focus" and key == "focus_priority":
-        # 대화
         if any(k in t for k in ["대화", "수다", "얘기", "말", "토크", "이야기", "조용", "편하게 얘기"]):
             cm["focus_priority"] = "대화 중심"
             return True
-
-        # 음식
         if any(k in t for k in ["음식", "먹는", "맛", "메뉴", "맛있는", "맛집", "배고파", "든든"]):
             cm["focus_priority"] = "음식 중심"
             return True
-
-        # 균형
         if any(k in t for k in ["둘", "비슷", "반반", "균형", "상관", "아무"]):
             cm["focus_priority"] = "균형"
             return True
-
         return False
 
-    # -----------------------------
-    # ALCOHOL PLAN
-    # -----------------------------
     if qtype == "enum_alcohol_plan" and key == "alcohol_plan":
         if any(k in t for k in ["한 곳", "한군데", "한 군데", "올인원", "한방에", "한 번에"]):
             cm["alcohol_plan"] = "한 곳"; return True
@@ -706,13 +657,10 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
             cm["alcohol_plan"] = "모르겠음"; return True
         return False
 
-    # -----------------------------
-    # ALCOHOL TYPE
-    # -----------------------------
     if qtype == "enum_alcohol_type" and key == "alcohol_type":
         if "소주" in t or "참이슬" in t or "처음처럼" in t:
             cm["alcohol_type"] = "소주"; return True
-        if any(k in t for k in ["맥주", "비어", "크래프트", "IPA", "라거", "에일"]):
+        if any(k in t for k in ["맥주", "비어", "크래프트", "ipa", "라거", "에일"]):
             cm["alcohol_type"] = "맥주"; return True
         if "와인" in t or "내추럴" in t:
             cm["alcohol_type"] = "와인"; return True
@@ -720,9 +668,6 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
             cm["alcohol_type"] = "상관없음"; return True
         return False
 
-    # -----------------------------
-    # MODE questions (optional)
-    # -----------------------------
     if pending_q.get("scope") == "mode":
         k = key
         maps = {
@@ -744,14 +689,13 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     return False
 
 # -----------------------------
-# Query build (relax 0~3) + focus_priority 반영(약하게)
+# Query build (relax 0~3) + focus 반영(약하게)
 # -----------------------------
 def build_query(conditions):
     normalize_conditions(conditions)
     cm = conditions["meta"]["common"]
     mode = conditions["meta"].get("context_mode")
     budget = conditions["meta"].get("budget_tier")
-    alcohol = cm.get("alcohol_level")
     alcohol_type = cm.get("alcohol_type")
     s = cm.get("sensitivity_level")
     focus = cm.get("focus_priority")
@@ -762,7 +706,6 @@ def build_query(conditions):
     if loc:
         tokens.append(loc)
 
-    # user food_type (optional)
     if conditions.get("food_type"):
         tokens.append(conditions["food_type"])
 
@@ -779,30 +722,21 @@ def build_query(conditions):
     else:
         place_token = "맛집"
 
-    # relax==0에서만 약한 컨텍스트 토큰 추가 (후보 풀 말라죽는 거 방지)
     if relax == 0:
         tokens.append(place_token)
 
         if mode == "연인 · 썸 · 소개팅" and kind != "drink":
             tokens.append("데이트")
-
         if mode == "회사 회식":
             tokens.append("회식")
-
         if budget == "가성비":
             tokens.append("가성비")
 
-        # 신경 레벨이 높으면 '분위기' 정도만
         if isinstance(s, int) and s >= 3 and kind == "meal":
             tokens.append("분위기")
 
-        # ✅ focus_priority: 대화 중심이면 조용/대화 토큰 약하게(검색어에만)
         if focus == "대화 중심":
-            # 너무 강하면 후보가 줄어서 '조용' 하나만
             tokens.append("조용")
-        elif focus == "음식 중심":
-            # 맛집 토큰은 이미 있어서 추가 X (과도제약 방지)
-            pass
 
     elif relax == 1:
         tokens.append(place_token)
@@ -977,7 +911,7 @@ def generate_pre_recommend_text(conditions, query):
     return (res.choices[0].message.content or "").strip()
 
 # -----------------------------
-# Chat UI render history
+# Chat UI
 # -----------------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -1033,7 +967,6 @@ if user_input:
 
         # 3) Next question
         next_q = get_next_question(conditions)
-
         if next_q and not (conditions["meta"].get("fast_mode") and next_q.get("key") not in ("location", "cannot_eat")):
             st.markdown(next_q["text"])
             st.session_state.messages.append({"role": "assistant", "content": next_q["text"]})
@@ -1048,7 +981,7 @@ if user_input:
             st.stop()
 
         # -----------------------------
-        # Kakao search: bigger pool + center/radius/distance
+        # Kakao search (pool 확장)
         # -----------------------------
         transport = cm.get("transport") or "상관없음"
         location = conditions.get("location")
@@ -1077,6 +1010,7 @@ if user_input:
         places = []
         used_query = None
 
+        # 기본 검색 + relax 단계
         for _ in range(4):
             base_query = build_query(conditions)
             variants = make_query_variants(base_query, location, int(cm.get("search_relax", 0)))
@@ -1096,6 +1030,39 @@ if user_input:
                 cm["search_relax"] = int(cm.get("search_relax", 0)) + 1
             else:
                 break
+
+        # ✅ v3.1: places가 너무 적으면 강제 확장 검색
+        kind_now = infer_place_kind(conditions)
+        if len(places) < 8:
+            fallback_queries = [
+                f"{location} 맛집",
+                f"{location} 음식점",
+                f"{location} 술집" if kind_now == "drink" else f"{location} 카페" if kind_now == "cafe" else f"{location} 맛집",
+            ]
+            for fq in fallback_queries:
+                try:
+                    if center:
+                        more = kakao_keyword_search_paged(
+                            fq, kakao_key,
+                            x=center["x"], y=center["y"],
+                            radius=20000, sort="distance",
+                            size=15, max_pages=5
+                        )
+                    else:
+                        more = kakao_keyword_search_paged(fq, kakao_key, size=15, max_pages=5)
+                except Exception:
+                    more = []
+
+                by_id = {p.get("id"): p for p in places if p.get("id")}
+                for p in more:
+                    pid = p.get("id")
+                    if pid and pid not in by_id:
+                        by_id[pid] = p
+                places = list(by_id.values())
+
+                if len(places) >= 15:
+                    used_query = fq
+                    break
 
         if not places:
             msg = "헉… 이 조건으로는 딱 맞는 데가 잘 안 잡히네 🥲\n조건을 조금 느슨하게 해서 근처 위주로 다시 뽑아볼까?"
@@ -1137,12 +1104,27 @@ if user_input:
         # -----------------------------
         # Filters BEFORE LLM
         # -----------------------------
-        kind = infer_place_kind(conditions)
-        filtered = filter_by_kind(focused, kind)
+        # kind 기준 필터 → (너무 줄면 내부에서 원복됨)
+        filtered = filter_by_kind(focused, kind_now)
+
+        # 상식 위반 방지 약필터
         filtered = mild_context_filter(filtered, conditions)
+
+        # 프차 제거 옵션
         filtered = filter_franchise(filtered, avoid_franchise)
 
+        # ✅ v3.1: candidates 최소 확보(필터 단계적 해제)
         candidates = filtered[:25]
+
+        if len(candidates) < 12:
+            candidates = focused[:25]
+
+        if len(candidates) < 12:
+            candidates = places[:25]
+
+        if len(candidates) < 3:
+            # 렌더/보장용 최후 확보
+            candidates = (places + focused)[:30]
 
         if debug_mode:
             with st.expander("🧪 (디버그) 후보 풀"):
@@ -1153,7 +1135,7 @@ if user_input:
                     "dist_m": p.get("_distance_m")
                 } for p in candidates[:15]]
                 st.json({
-                    "kind": kind,
+                    "kind": kind_now,
                     "raw_places": len(places),
                     "focused": len(focused),
                     "after_filters": len(filtered),
@@ -1170,6 +1152,7 @@ if user_input:
             with st.expander("🤖 (디버그) rerank LLM 원문"):
                 st.code(st.session_state.debug_raw_rerank)
 
+        # ✅ FINAL: 반드시 3개 채움
         picks = ensure_3_picks(picks, candidates)
 
         # -----------------------------
@@ -1240,7 +1223,7 @@ if user_input:
                 f.write(json.dumps({
                     "ts": int(time.time()),
                     "query_used": used_query,
-                    "kind": kind,
+                    "kind": kind_now,
                     "avoid_franchise": avoid_franchise,
                     "center": cm.get("center_name"),
                     "conditions": conditions,
