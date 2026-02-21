@@ -1,9 +1,12 @@
-# decision_mate_app_final_v3_1.py
+# decision_mate_app_final_v3_2.py
 # Streamlit prototype for "결정 메이트" (Decision Mate)
-# v3.1 hotfix:
-# - "1개만 뜸" 방지: 후보 풀이 3개 미만이면 강제 확장 검색 + 필터 단계적 해제 + ensure_3_picks
-# - focus_priority(대화/음식/균형) 공통 질문 포함
-# - apply_answer() 자연어 인식 강화(선택지 정확 문장 강제 X)
+# v3.2:
+# - 술 질문 "없음" 인식 버그 fix
+# - API 키 session_state 저장 (리런/상황 변경에도 유지)
+# - "새 추천 시작(키 유지)" 버튼
+# - 후보 풀 부족(1개만 뜸) 방지: 강제 확장 검색 + 필터 단계적 해제 + ensure_3_picks
+# - 렌더 단계에서 3개 항상 채우기(예외 케이스 방어)
+# - focus_priority(대화/음식/균형) 공통 질문 포함 + 자연어 인식 강화
 
 import json
 import re
@@ -22,11 +25,34 @@ st.title("🍽️ 결정 메이트 (Decision Mate)")
 st.caption("맛집 추천이 아니라, 약속 장소 ‘결정 피로’를 줄이는 대화형 AI")
 
 # -----------------------------
+# Session State: Key persistence
+# -----------------------------
+if "openai_key" not in st.session_state:
+    st.session_state.openai_key = ""
+if "kakao_key" not in st.session_state:
+    st.session_state.kakao_key = ""
+
+# -----------------------------
 # Sidebar
 # -----------------------------
 st.sidebar.header("🔑 API 설정")
-openai_key = st.sidebar.text_input("OpenAI API Key", type="password")
-kakao_key = st.sidebar.text_input("Kakao Local REST API Key", type="password")
+
+openai_key = st.sidebar.text_input(
+    "OpenAI API Key",
+    type="password",
+    value=st.session_state.openai_key,
+    key="openai_key_input",
+)
+kakao_key = st.sidebar.text_input(
+    "Kakao Local REST API Key",
+    type="password",
+    value=st.session_state.kakao_key,
+    key="kakao_key_input",
+)
+
+# persist
+st.session_state.openai_key = openai_key
+st.session_state.kakao_key = kakao_key
 
 st.sidebar.markdown("---")
 debug_mode = st.sidebar.checkbox("🛠️ 디버그 모드(LLM 원문/후보풀 출력)", value=False)
@@ -34,16 +60,10 @@ debug_mode = st.sidebar.checkbox("🛠️ 디버그 모드(LLM 원문/후보풀 
 client = OpenAI(api_key=openai_key) if openai_key else None
 
 # -----------------------------
-# Session State
+# Session State: core
 # -----------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = [{
-        "role": "assistant",
-        "content": "오케이 😎\n오늘 어디서 누구랑 뭐 먹을지 내가 딱 정해줄게.\n일단 **어느 동네/역 근처**에서 찾을까?"
-    }]
-
-if "conditions" not in st.session_state:
-    st.session_state.conditions = {
+def init_conditions():
+    return {
         "location": None,
         "food_type": None,
         "purpose": None,
@@ -74,6 +94,18 @@ if "conditions" not in st.session_state:
         }
     }
 
+def init_messages():
+    return [{
+        "role": "assistant",
+        "content": "오케이 😎\n오늘 어디서 누구랑 뭐 먹을지 내가 딱 정해줄게.\n일단 **어느 동네/역 근처**에서 찾을까?"
+    }]
+
+if "messages" not in st.session_state:
+    st.session_state.messages = init_messages()
+
+if "conditions" not in st.session_state:
+    st.session_state.conditions = init_conditions()
+
 if "last_picks_ids" not in st.session_state:
     st.session_state.last_picks_ids = []
 
@@ -88,6 +120,17 @@ if "debug_raw_rerank" not in st.session_state:
 
 if "loc_center_cache" not in st.session_state:
     st.session_state.loc_center_cache = {}
+
+# -----------------------------
+# Sidebar: reset button (keys kept)
+# -----------------------------
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 새 추천 시작(키 유지)"):
+    st.session_state.messages = init_messages()
+    st.session_state.pending_question = None
+    st.session_state.last_picks_ids = []
+    st.session_state.conditions = init_conditions()
+    st.rerun()
 
 # -----------------------------
 # Helpers
@@ -256,9 +299,7 @@ def haversine_m(x1, y1, x2, y2):
     return 6371000 * c
 
 def estimate_walk_minutes(distance_m: float, speed_m_per_min: float = 80.0) -> int:
-    if distance_m is None:
-        return 999
-    if distance_m >= 10**11:
+    if distance_m is None or distance_m >= 10**11:
         return 999
     return max(1, int(math.ceil(distance_m / speed_m_per_min)))
 
@@ -336,7 +377,7 @@ def sort_places_for_transport(places: list, center: dict, transport: str):
         px, py = p.get("x"), p.get("y")
         dist = haversine_m(cx, cy, px, py) if (px and py) else 10**12
         park = parking_signal_score(p) if transport == "차" else 0
-        score = dist - (park * 120)  # 약한 가중치
+        score = dist - (park * 120)
         scored.append((score, dist, p))
     scored.sort(key=lambda t: (t[0], t[1]))
     return [p for _, __, p in scored]
@@ -375,9 +416,6 @@ def filter_by_kind(places: list, kind: str):
         return out if len(out) >= 10 else places
     return places
 
-# -----------------------------
-# Mild "too heavy" filter
-# -----------------------------
 def mild_context_filter(places: list, conditions: dict):
     normalize_conditions(conditions)
     mode = conditions["meta"].get("context_mode")
@@ -386,7 +424,6 @@ def mild_context_filter(places: list, conditions: dict):
         return places
     if not isinstance(s, int) or s < 3:
         return places
-
     banned = ["오마카세", "파인다이닝", "코스요리", "테이스팅", "셰프", "한우오마카세"]
     out = []
     for p in places:
@@ -551,7 +588,7 @@ def get_next_question(conditions: dict):
     return get_next_mode_question(conditions)
 
 # -----------------------------
-# ✅ apply_answer (자연어 대응 강화)
+# apply_answer (자연어 대응 강화 + 술 없음 fix)
 # -----------------------------
 def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     normalize_conditions(conditions)
@@ -588,20 +625,38 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
         cm["cannot_eat_done"] = True
         return True
 
+    # ✅ 술 없음 버그 fix: "없음/없어/ㄴㄴ/x/no" 등 단답 포함
     if qtype == "enum_alcohol" and key == "alcohol_level":
-        if any(k in t_low for k in ["안 마", "술 안", "금주", "노알콜", "노 알콜", "못 마", "안먹", "안 먹"]):
+        if t_low in ["없음", "없어", "노", "no", "x", "ㄴㄴ", "안함", "안 해", "안해", "패스"]:
             cm["alcohol_level"] = "없음"
             cm["alcohol_plan"] = None
             cm["alcohol_type"] = None
             return True
-        if any(k in t_low for k in ["가볍", "한두잔", "한두 잔", "적당히", "조금", "살짝", "1~2잔", "1-2잔"]):
+
+        if any(k in t_low for k in [
+            "없음", "없어", "안 마", "술 안", "금주", "노알콜", "노 알콜",
+            "못 마", "안먹", "안 먹", "안 마셔", "안마셔"
+        ]):
+            cm["alcohol_level"] = "없음"
+            cm["alcohol_plan"] = None
+            cm["alcohol_type"] = None
+            return True
+
+        if any(k in t_low for k in [
+            "가볍", "한두잔", "한두 잔", "적당히", "조금", "살짝",
+            "1~2잔", "1-2잔", "한잔", "한 잔"
+        ]):
             cm["alcohol_level"] = "가볍게"
             cm["alcohol_plan"] = None
             cm["alcohol_type"] = None
             return True
-        if any(k in t_low for k in ["술 중심", "제대로", "많이", "달릴", "끝까지", "취할", "폭", "쭉"]):
+
+        if any(k in t_low for k in [
+            "술 중심", "제대로", "많이", "달릴", "끝까지", "취할", "폭", "쭉", "진하게"
+        ]):
             cm["alcohol_level"] = "술 중심"
             return True
+
         return False
 
     if qtype == "enum_transport" and key == "transport":
@@ -660,7 +715,7 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     if qtype == "enum_alcohol_type" and key == "alcohol_type":
         if "소주" in t or "참이슬" in t or "처음처럼" in t:
             cm["alcohol_type"] = "소주"; return True
-        if any(k in t for k in ["맥주", "비어", "크래프트", "ipa", "라거", "에일"]):
+        if any(k in t_low for k in ["맥주", "비어", "크래프트", "ipa", "라거", "에일"]):
             cm["alcohol_type"] = "맥주"; return True
         if "와인" in t or "내추럴" in t:
             cm["alcohol_type"] = "와인"; return True
@@ -724,17 +779,14 @@ def build_query(conditions):
 
     if relax == 0:
         tokens.append(place_token)
-
         if mode == "연인 · 썸 · 소개팅" and kind != "drink":
             tokens.append("데이트")
         if mode == "회사 회식":
             tokens.append("회식")
         if budget == "가성비":
             tokens.append("가성비")
-
         if isinstance(s, int) and s >= 3 and kind == "meal":
             tokens.append("분위기")
-
         if focus == "대화 중심":
             tokens.append("조용")
 
@@ -886,9 +938,6 @@ def rerank_and_format(conditions, places):
     picks = data.get("picks", [])
     return picks if isinstance(picks, list) else []
 
-# -----------------------------
-# Pre recommend text
-# -----------------------------
 def generate_pre_recommend_text(conditions, query):
     if client is None:
         return f"오케이ㅋㅋ **{query}**로 바로 3곳 뽑아볼게 🔍"
@@ -911,7 +960,7 @@ def generate_pre_recommend_text(conditions, query):
     return (res.choices[0].message.content or "").strip()
 
 # -----------------------------
-# Chat UI
+# Render history
 # -----------------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -1031,7 +1080,7 @@ if user_input:
             else:
                 break
 
-        # ✅ v3.1: places가 너무 적으면 강제 확장 검색
+        # ✅ places가 너무 적으면 강제 확장 검색
         kind_now = infer_place_kind(conditions)
         if len(places) < 8:
             fallback_queries = [
@@ -1104,26 +1153,17 @@ if user_input:
         # -----------------------------
         # Filters BEFORE LLM
         # -----------------------------
-        # kind 기준 필터 → (너무 줄면 내부에서 원복됨)
         filtered = filter_by_kind(focused, kind_now)
-
-        # 상식 위반 방지 약필터
         filtered = mild_context_filter(filtered, conditions)
-
-        # 프차 제거 옵션
         filtered = filter_franchise(filtered, avoid_franchise)
 
-        # ✅ v3.1: candidates 최소 확보(필터 단계적 해제)
+        # ✅ candidates 최소 확보(필터 단계적 해제)
         candidates = filtered[:25]
-
         if len(candidates) < 12:
             candidates = focused[:25]
-
         if len(candidates) < 12:
             candidates = places[:25]
-
         if len(candidates) < 3:
-            # 렌더/보장용 최후 확보
             candidates = (places + focused)[:30]
 
         if debug_mode:
@@ -1144,21 +1184,47 @@ if user_input:
                 })
 
         # -----------------------------
-        # Rerank
+        # Rerank + ensure 3
         # -----------------------------
         picks = rerank_and_format(conditions, candidates)
-
         if debug_mode:
             with st.expander("🤖 (디버그) rerank LLM 원문"):
                 st.code(st.session_state.debug_raw_rerank)
 
-        # ✅ FINAL: 반드시 3개 채움
         picks = ensure_3_picks(picks, candidates)
 
         # -----------------------------
-        # Render
+        # Render (항상 3개 채우기)
         # -----------------------------
         kakao_map = {p.get("id"): p for p in candidates if p.get("id")}
+
+        # 방어: 혹시 pick id가 map에 없으면 candidates에서 대체 채우기
+        used = set()
+        final_picks = []
+        for pk in picks:
+            pid = pk.get("id")
+            if pid and pid in kakao_map and pid not in used:
+                used.add(pid)
+                final_picks.append(pk)
+
+        if len(final_picks) < 3:
+            for p in candidates:
+                pid = p.get("id")
+                if not pid or pid in used:
+                    continue
+                used.add(pid)
+                final_picks.append({
+                    "id": pid,
+                    "scene_feel": "후보 풀에서 무난하게 맞는 곳도 같이 챙겨뒀어. 링크로 분위기만 빠르게 확인하면 돼.",
+                    "one_line": "근처에서 안정적으로 가기 좋은 선택지!",
+                    "hashtags": ["#근처", "#무난", "#바로가기", "#후보추가"],
+                    "matched_conditions": ["근처 우선"],
+                    "reason": "추천 누락이 생겨서 후보 풀 상위에서 대신 채웠어 😎"
+                })
+                if len(final_picks) >= 3:
+                    break
+
+        final_picks = final_picks[:3]
 
         st.markdown("---")
         st.subheader("🍽️ 딱 3곳만 골랐어")
@@ -1168,13 +1234,14 @@ if user_input:
         current_pick_ids = []
         center_name = cm.get("center_name") or "기준점"
 
-        for i, pick in enumerate(picks[:3]):
+        for i in range(3):
+            pick = final_picks[i]
             pid = pick.get("id")
             place = kakao_map.get(pid)
             if not place:
                 continue
-            current_pick_ids.append(pid)
 
+            current_pick_ids.append(pid)
             with cols[i]:
                 name = place.get("place_name")
                 addr = place.get("road_address_name") or place.get("address_name")
@@ -1217,7 +1284,7 @@ if user_input:
 
         st.session_state.last_picks_ids = current_pick_ids
 
-        # optional log
+        # log (optional)
         try:
             with open("decision_mate_logs.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps({
@@ -1227,18 +1294,18 @@ if user_input:
                     "avoid_franchise": avoid_franchise,
                     "center": cm.get("center_name"),
                     "conditions": conditions,
-                    "picks": picks,
+                    "picks": final_picks,
                     "place_ids": current_pick_ids,
                     "pool_counts": {
-                        "raw_places": len(places),
+                        "places": len(places),
                         "focused": len(focused),
-                        "after_filters": len(filtered),
+                        "filtered": len(filtered),
                         "candidates": len(candidates),
                     }
                 }, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
-        final = "끝! 😎\n셋 중에 하나 고르거나, '대화 더 되는 쪽', '음식 더 확실한 쪽', '프차 빼줘', '방금 추천 제외하고 다시' 이런 식으로 다시 시켜도 돼."
-        st.session_state.messages.append({"role": "assistant", "content": final})
-        st.markdown(final)
+        final_msg = "끝! 😎\n셋 중에 하나 고르거나, '대화 더 되는 쪽', '음식 더 확실한 쪽', '프차 빼줘', '방금 추천 제외하고 다시' 이런 식으로 다시 시켜도 돼."
+        st.session_state.messages.append({"role": "assistant", "content": final_msg})
+        st.markdown(final_msg)
