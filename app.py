@@ -1,12 +1,11 @@
-# decision_mate_app_final_v3_2.py
+# decision_mate_app_final_v3_21.py
 # Streamlit prototype for "결정 메이트" (Decision Mate)
-# v3.2:
+# v3.21:
+# - 사이드바 필터 변경 시: 대화 유지 + 질문만 새로(answers/pending/common 일부 reset)
+# - 새 추천 버튼: 전체 리셋(키 유지)
 # - 술 질문 "없음" 인식 버그 fix
-# - API 키 session_state 저장 (리런/상황 변경에도 유지)
-# - "새 추천 시작(키 유지)" 버튼
-# - 후보 풀 부족(1개만 뜸) 방지: 강제 확장 검색 + 필터 단계적 해제 + ensure_3_picks
-# - 렌더 단계에서 3개 항상 채우기(예외 케이스 방어)
-# - focus_priority(대화/음식/균형) 공통 질문 포함 + 자연어 인식 강화
+# - 후보 풀 확장 + 필터 단계적 해제 + 3개 보장(ensure_3_picks) + 렌더 3개 채우기
+# - 자연어 대응 강화(뚜벅이/걸어갈거야/없음 등)
 
 import json
 import re
@@ -33,7 +32,7 @@ if "kakao_key" not in st.session_state:
     st.session_state.kakao_key = ""
 
 # -----------------------------
-# Sidebar
+# Sidebar: API keys
 # -----------------------------
 st.sidebar.header("🔑 API 설정")
 
@@ -50,7 +49,7 @@ kakao_key = st.sidebar.text_input(
     key="kakao_key_input",
 )
 
-# persist
+# persist keys across reruns
 st.session_state.openai_key = openai_key
 st.session_state.kakao_key = kakao_key
 
@@ -78,7 +77,7 @@ def init_conditions():
             "context_mode": None,
             "people_count": None,
             "budget_tier": "상관없음",
-            "answers": {},
+            "answers": {},  # mode-specific answers
             "common": {
                 "cannot_eat_done": False,
                 "alcohol_level": None,        # 없음 / 가볍게 / 술 중심
@@ -122,7 +121,7 @@ if "loc_center_cache" not in st.session_state:
     st.session_state.loc_center_cache = {}
 
 # -----------------------------
-# Sidebar: reset button (keys kept)
+# Sidebar: "새 추천 시작" button (keys kept)
 # -----------------------------
 st.sidebar.markdown("---")
 if st.sidebar.button("🔄 새 추천 시작(키 유지)"):
@@ -184,11 +183,13 @@ def normalize_conditions(cond: dict):
 def merge_conditions(base: dict, patch: dict):
     if not isinstance(patch, dict):
         return base
+
     if "constraints" in patch and isinstance(patch["constraints"], dict):
         for k, v in patch["constraints"].items():
             if v is None:
                 continue
             base["constraints"][k] = v
+
     if "meta" in patch and isinstance(patch["meta"], dict):
         base_meta = base.get("meta", {}) or {}
         for k, v in patch["meta"].items():
@@ -196,14 +197,25 @@ def merge_conditions(base: dict, patch: dict):
                 continue
             base_meta[k] = v
         base["meta"] = base_meta
+
     for k, v in patch.items():
         if k in ("constraints", "meta"):
             continue
         if v is None:
             continue
         base[k] = v
+
     normalize_conditions(base)
     return base
+
+def sync_sidebar_to_conditions(conditions, selected_mode, people_count, budget_tier):
+    """사이드바 필터 값을 conditions에 강제로 싱크(한 군데에서만 수행)"""
+    normalize_conditions(conditions)
+    meta = conditions["meta"]
+    meta["context_mode"] = None if selected_mode == "선택 안 함" else selected_mode
+    meta["people_count"] = int(people_count) if people_count else None
+    meta["budget_tier"] = budget_tier
+    return conditions
 
 def detect_skip_intent(text: str) -> bool:
     t = (text or "").strip()
@@ -240,11 +252,34 @@ selected_mode = st.sidebar.selectbox("상황 모드", MODE_OPTIONS, index=0)
 people_count = st.sidebar.number_input("인원", min_value=1, max_value=30, value=2, step=1)
 budget_tier = st.sidebar.radio("예산대(1인)", BUDGET_OPTIONS, index=0)
 
-normalize_conditions(st.session_state.conditions)
-meta = st.session_state.conditions["meta"]
-meta["context_mode"] = None if selected_mode == "선택 안 함" else selected_mode
-meta["people_count"] = int(people_count) if people_count else None
-meta["budget_tier"] = budget_tier
+# ✅ v3.21: 필터 변경 감지 -> 대화는 유지, 질문만 새로 (answers/pending/common 일부 reset)
+profile = f"{selected_mode}|{int(people_count)}|{budget_tier}"
+prev_profile = st.session_state.get("sidebar_profile")
+if prev_profile is None:
+    st.session_state.sidebar_profile = profile
+else:
+    if profile != prev_profile:
+        st.session_state.sidebar_profile = profile
+
+        # 1) 진행 중 질문 제거(이전 질문이 남아있으면 꼬임 방지)
+        st.session_state.pending_question = None
+
+        # 2) 모드별 질문 답변 초기화 (대화는 유지)
+        normalize_conditions(st.session_state.conditions)
+        st.session_state.conditions["meta"]["answers"] = {}
+
+        # 3) fast_mode는 끄는 게 자연스러움
+        st.session_state.conditions["meta"]["fast_mode"] = False
+
+        # 4) (선택) 모드/예산/인원 바뀌면 민감도/포커스는 새로 묻게
+        st.session_state.conditions["meta"]["common"]["sensitivity_level"] = None
+        st.session_state.conditions["meta"]["common"]["focus_priority"] = None
+
+        # UX: 필터 반영 알림(짧게)
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "오케이, 상황 바뀐 거 반영해서 질문만 다시 갈게 😎"
+        })
 
 # -----------------------------
 # Kakao Local API
@@ -744,7 +779,7 @@ def apply_answer(conditions: dict, pending_q: dict, user_text: str) -> bool:
     return False
 
 # -----------------------------
-# Query build (relax 0~3) + focus 반영(약하게)
+# Query build (relax 0~3)
 # -----------------------------
 def build_query(conditions):
     normalize_conditions(conditions)
@@ -815,7 +850,7 @@ def make_query_variants(base_query: str, location: str, relax_level: int):
     return out
 
 # -----------------------------
-# Candidate filtering
+# Candidate filtering helpers
 # -----------------------------
 def filter_places(places, exclude_ids):
     if not exclude_ids:
@@ -977,13 +1012,16 @@ if user_input:
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
-
         if not openai_key or not kakao_key:
             st.warning("사이드바에 OpenAI 키랑 Kakao 키부터 넣어줘!")
             st.stop()
 
         normalize_conditions(st.session_state.conditions)
         conditions = st.session_state.conditions
+
+        # ✅ v3.21: 매 턴 시작 시 사이드바 필터 -> conditions 강제 싱크
+        conditions = sync_sidebar_to_conditions(conditions, selected_mode, people_count, budget_tier)
+        st.session_state.conditions = conditions
         cm = conditions["meta"]["common"]
 
         # intents
@@ -1003,11 +1041,15 @@ if user_input:
         diversify = bool(patch.pop("diversify", False))
         exclude_last = bool(patch.pop("exclude_last", False))
         avoid_franchise = bool(patch.pop("avoid_franchise", False))
+
         conditions = merge_conditions(conditions, patch)
+        # (중요) patch로 meta가 들어오더라도, 마지막에 사이드바 싱크로 덮어야 "필터 우선"이 됨
+        conditions = sync_sidebar_to_conditions(conditions, selected_mode, people_count, budget_tier)
+
         st.session_state.conditions = conditions
         cm = conditions["meta"]["common"]
 
-        # Debug
+        # Debug: current conditions
         with st.expander("🧾 현재 누적 조건(JSON)"):
             st.json(conditions)
             if debug_mode:
@@ -1016,12 +1058,15 @@ if user_input:
 
         # 3) Next question
         next_q = get_next_question(conditions)
+
+        # fast_mode면 location/cannot_eat만 강제하고 나머지 질문 생략
         if next_q and not (conditions["meta"].get("fast_mode") and next_q.get("key") not in ("location", "cannot_eat")):
             st.markdown(next_q["text"])
             st.session_state.messages.append({"role": "assistant", "content": next_q["text"]})
             st.session_state.pending_question = next_q
             st.stop()
 
+        # 최소 location 확보
         if not conditions.get("location"):
             msg = "좋아! 근데 **동네/역**부터 알려줘야 내가 뽑아주지 😎\n예: `합정`, `연남동`, `강남역`"
             st.markdown(msg)
@@ -1080,13 +1125,13 @@ if user_input:
             else:
                 break
 
-        # ✅ places가 너무 적으면 강제 확장 검색
+        # places가 너무 적으면 강제 확장 검색
         kind_now = infer_place_kind(conditions)
         if len(places) < 8:
             fallback_queries = [
                 f"{location} 맛집",
                 f"{location} 음식점",
-                f"{location} 술집" if kind_now == "drink" else f"{location} 카페" if kind_now == "cafe" else f"{location} 맛집",
+                f"{location} 술집" if kind_now == "drink" else (f"{location} 카페" if kind_now == "cafe" else f"{location} 맛집"),
             ]
             for fq in fallback_queries:
                 try:
@@ -1157,7 +1202,7 @@ if user_input:
         filtered = mild_context_filter(filtered, conditions)
         filtered = filter_franchise(filtered, avoid_franchise)
 
-        # ✅ candidates 최소 확보(필터 단계적 해제)
+        # candidates 최소 확보(필터 단계적 해제)
         candidates = filtered[:25]
         if len(candidates) < 12:
             candidates = focused[:25]
@@ -1198,7 +1243,6 @@ if user_input:
         # -----------------------------
         kakao_map = {p.get("id"): p for p in candidates if p.get("id")}
 
-        # 방어: 혹시 pick id가 map에 없으면 candidates에서 대체 채우기
         used = set()
         final_picks = []
         for pk in picks:
@@ -1284,7 +1328,7 @@ if user_input:
 
         st.session_state.last_picks_ids = current_pick_ids
 
-        # log (optional)
+        # optional log
         try:
             with open("decision_mate_logs.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps({
